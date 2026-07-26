@@ -33,6 +33,9 @@ jobs:
     needs: format_style
     name: Build and push docker images as local
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
     -
       name: Check out the repo
@@ -89,6 +92,9 @@ jobs:
     needs: build_and_push_docker_images_as_local
     name: Build coverage image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
     -
       name: Check out the repo
@@ -176,6 +182,9 @@ jobs:
     needs: unit_tests_and_coverage
     name: Push docker images to Docker/Github Hubs as latest
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
     -
       name: Login to Docker Hub
