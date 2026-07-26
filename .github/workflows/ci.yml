@@ -1,0 +1,220 @@
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Docker images tag'
+        required: true
+  push:
+    branches:
+    - master
+    tags:
+    - v*.*.*
+
+  pull_request:
+    branches:
+    - master
+
+jobs:
+  format_style:
+    name: Check source code format
+    runs-on: ubuntu-latest
+    steps:
+    -
+      name: Check out the repo
+      uses: actions/checkout@v4
+    -
+      name: Run frankwolf format
+      run: |
+          sources=$(find . -name "*.hpp" -o -name "*.cpp")
+          ! docker run -i --rm -v $PWD:/data frankwolf/astyle --dry-run ${sources} | grep ^Formatted
+
+  build_and_push_docker_images_as_local:
+    needs: format_style
+    name: Build and push docker images as local
+    runs-on: ubuntu-latest
+    steps:
+    -
+      name: Check out the repo
+      uses: actions/checkout@v4
+    -
+      name: Login to Docker Hub
+      uses: docker/login-action@v1
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        logout: true
+    -
+      name: Login to GitHub Container Registry
+      uses: docker/login-action@v1
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        logout: true
+    -
+      name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    -
+      name: Build local builder image (deps stage)
+      id: docker_build1
+      uses: docker/build-push-action@v2
+      with:
+        tags: ghcr.io/testillano/diametercomm_builder:local
+        file: Dockerfile
+        target: deps
+        context: .
+        platforms: linux/amd64
+        no-cache: true
+        push: true
+    -
+      name: Image digest
+      run: echo ${{ steps.docker_build1.outputs.digest }}
+    -
+      name: Build local unit-test image
+      id: docker_build2
+      uses: docker/build-push-action@v2
+      with:
+        tags: ghcr.io/testillano/diametercomm_ut:local
+        file: Dockerfile
+        target: unit-test
+        context: .
+        platforms: linux/amd64
+        push: true
+    -
+      name: Image2 digest
+      run: echo ${{ steps.docker_build2.outputs.digest }}
+
+  build_coverage:
+    needs: build_and_push_docker_images_as_local
+    name: Build coverage image
+    runs-on: ubuntu-latest
+    steps:
+    -
+      name: Check out the repo
+      uses: actions/checkout@v4
+    -
+      name: Login to GitHub Container Registry
+      uses: docker/login-action@v1
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        logout: true
+    -
+      name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    -
+      name: Build coverage image (debug build stage with lcov)
+      id: docker_build3
+      uses: docker/build-push-action@v2
+      with:
+        tags: ghcr.io/testillano/diametercomm:latest-cov
+        file: Dockerfile
+        target: build
+        build-args: build_type=Debug
+        context: .
+        platforms: linux/amd64
+        push: true
+    -
+      name: Image digest
+      run: echo ${{ steps.docker_build3.outputs.digest }}
+
+  unit_tests_and_coverage:
+    needs: build_coverage
+    name: Run unit tests and upload coverage info
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    container:
+      image: ghcr.io/testillano/diametercomm:latest-cov
+      options: "--entrypoint sh"
+    steps:
+    -
+      name: Install coverage tools
+      run: apt-get update && apt-get install -y lcov bc
+    -
+      name: Run unit tests and generate coverage
+      run: |
+        cd /code
+        CAPTURE_OPTS="--ignore-errors empty --ignore-errors inconsistent --ignore-errors mismatch"
+        lcov --capture --directory ./src --directory ./ut --initial --output-file base-coverage.info ${CAPTURE_OPTS}
+        ./build/Debug/bin/unit-test
+        lcov --capture --directory ./src --directory ./ut --output-file test-coverage.info --ignore-errors gcov,gcov ${CAPTURE_OPTS}
+        lcov -a base-coverage.info -a test-coverage.info -o total-coverage.info
+        lcov --extract total-coverage.info "/code/src/*" --output-file extracted-coverage.info
+        lcov --remove extracted-coverage.info "main.cpp" --output-file final-coverage.info --ignore-errors unused
+        genhtml final-coverage.info --output-directory /code/coverage
+        cp final-coverage.info /code/coverage/lcov.info
+    -
+      name: Setup Pages
+      uses: actions/configure-pages@v3
+    -
+      name: Create badge json file
+      run: |
+        value=$(grep -oP 'headerCovTableEntry(Hi|Med|Lo)">[0-9]+\.[0-9]+' /code/coverage/index.html | grep -oP '[0-9]+\.[0-9]+' | head -n 1)
+        if [ "$(echo "${value} < 50" | bc -l)" = "1" ]; then
+          color="red"
+        elif [ "$(echo "${value} < 80" | bc -l)" = "1" ]; then
+          color="orange"
+        else
+          color="brightgreen"
+        fi
+
+        echo '{"schemaVersion":1,"label":"coverage","message":"'${value}'%","color":"'${color}'"}' > /code/coverage/badge.json
+    -
+      name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: /code/coverage
+    -
+      name: Deploy to GitHub Pages
+      uses: actions/deploy-pages@v4
+
+  push_docker_images_as_latest:
+    needs: unit_tests_and_coverage
+    name: Push docker images to Docker/Github Hubs as latest
+    runs-on: ubuntu-latest
+    steps:
+    -
+      name: Login to Docker Hub
+      uses: docker/login-action@v1
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        logout: true
+    -
+      name: Login to GitHub Container Registry
+      uses: docker/login-action@v1
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        logout: true
+    -
+      name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    -
+      name: Push images manually
+      run: |
+        # workflow dispatch event:
+        image_tag=${{ github.event.inputs.tag }}
+        echo Workflow dispatch image_tag=$image_tag
+
+        # Strip git ref prefix from version
+        [ -z "${image_tag}" ] && image_tag=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+
+        # Strip "v" prefix from tag name
+        [[ "${{ github.ref }}" == "refs/tags/"* ]] && image_tag=$(echo $image_tag | sed -e 's/^v//')
+
+        # Use Docker `latest` tag convention
+        [ "$image_tag" == "master" ] && image_tag=latest
+
+        echo Processed image_tag=$image_tag
+
+        for imgbn in diametercomm_builder diametercomm_ut
+        do
+          echo "Creating tag ${image_tag} for ${imgbn} in ghcr.io"
+          docker buildx imagetools create -t ghcr.io/testillano/${imgbn}:${image_tag} ghcr.io/testillano/${imgbn}:local
+        done
