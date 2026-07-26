@@ -80,8 +80,15 @@ void DiameterServer::stopListening() {
 void DiameterServer::shutdown(uint32_t disconnectCause) {
     stopListening();
 
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    for (auto& peer : peers_) {
+    // Copy peers under lock, then operate without lock to avoid deadlock:
+    // peer->disconnect() may synchronously trigger setState(Closed) ->
+    // onPeerStateChange() which needs peersMutex_.
+    std::vector<std::shared_ptr<Peer>> peersCopy;
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        peersCopy = peers_;
+    }
+    for (auto& peer : peersCopy) {
         if (peer->state() == Peer::State::Open) {
             peer->disconnect(disconnectCause);
         }
@@ -91,11 +98,18 @@ void DiameterServer::shutdown(uint32_t disconnectCause) {
 void DiameterServer::close() {
     stopListening();
 
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    for (auto& peer : peers_) {
+    // Move peers out under lock, then close without lock to avoid deadlock:
+    // peer->close() triggers setState(Closed) -> onPeerStateChange() which
+    // needs peersMutex_.
+    std::vector<std::shared_ptr<Peer>> peersCopy;
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        peersCopy = std::move(peers_);
+        peers_.clear();
+    }
+    for (auto& peer : peersCopy) {
         peer->close();
     }
-    peers_.clear();
 }
 
 size_t DiameterServer::activePeerCount() const {

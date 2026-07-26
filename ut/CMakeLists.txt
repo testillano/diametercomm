@@ -2,6 +2,8 @@ add_executable(unit-test "")
 
 add_subdirectory(PeerConnection)
 add_subdirectory(Peer)
+add_subdirectory(DiameterServer)
+add_subdirectory(DiameterClient)
 
 # Imported libraries
 add_library(ert_logger STATIC IMPORTED)

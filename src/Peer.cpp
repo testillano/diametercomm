@@ -373,8 +373,9 @@ void Peer::handleDWA(const Buffer& /*msg*/) {
 // ============================================================================
 void Peer::handleDPR(const Buffer& msg) {
     auto dpa = buildDPA(msg);
-    connection_->asyncWrite(std::move(dpa), [this]() {
-        close();
+    auto self = shared_from_this();
+    connection_->asyncWrite(std::move(dpa), [self]() {
+        self->close();
     });
 }
 
