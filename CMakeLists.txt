@@ -62,6 +62,12 @@ endif()
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(Threads REQUIRED)
 
+###########
+# Install #
+###########
+include(GNUInstallDirs)
+message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
+
 ##################
 # Subdirectories #
 ##################
@@ -70,16 +76,6 @@ if(ERT_DIAMETERCOMM_BuildTests)
   add_subdirectory(ut)
 endif()
 
-option(BUILD_EXAMPLES "Build example programs" OFF)
-if(BUILD_EXAMPLES)
-  add_subdirectory(examples)
-endif()
-
-###########
-# Install #
-###########
-include(GNUInstallDirs)
-message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
 install(
   DIRECTORY ${ERT_DIAMETERCOMM_INCLUDE_BUILD_DIR}/ert/diametercomm
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ert
