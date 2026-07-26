@@ -41,6 +41,14 @@ message(STATUS "CMAKE_ARCHIVE_OUTPUT_DIRECTORY is ${CMAKE_ARCHIVE_OUTPUT_DIRECTO
 
 # Compiler flags
 add_compile_options(-Wall -Wextra -Wpedantic)
+add_compile_options(
+  $<$<CONFIG:Debug>:-O0>
+  $<$<CONFIG:Debug>:-g3>
+  $<$<CONFIG:Debug>:--coverage>
+)
+link_libraries(
+  $<$<CONFIG:Debug>:--coverage>
+)
 
 # CMAKE_PREFIX_PATH
 if(NOT CMAKE_PREFIX_PATH)
