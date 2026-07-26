@@ -14,6 +14,7 @@ endif()
 #############
 set(ERT_DIAMETERCOMM_TARGET_NAME       ${PROJECT_NAME})
 set(ERT_DIAMETERCOMM_INCLUDE_BUILD_DIR "${PROJECT_SOURCE_DIR}/include")
+option(ERT_DIAMETERCOMM_BuildTests "Build the unit tests." ${MAIN_PROJECT})
 
 # C++ Standard
 set(CMAKE_CXX_STANDARD 17)
@@ -65,7 +66,7 @@ find_package(Threads REQUIRED)
 # Subdirectories #
 ##################
 add_subdirectory(src)
-if(MAIN_PROJECT)
+if(ERT_DIAMETERCOMM_BuildTests)
   add_subdirectory(ut)
 endif()
 
