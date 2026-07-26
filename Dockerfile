@@ -162,7 +162,7 @@ ARG build_type=Release
 COPY . /code
 WORKDIR /code
 
-RUN cmake -DCMAKE_BUILD_TYPE=${build_type} . && make -j${make_procs}
+RUN cmake -DCMAKE_BUILD_TYPE=${build_type} -DBUILD_EXAMPLES=ON . && make -j${make_procs}
 
 # =============================================================================
 # Stage: unit-test (lightweight image for running tests)
@@ -174,4 +174,17 @@ ARG build_type=Release
 COPY --from=build /code/build/${build_type}/bin/unit-test /opt/unit-test
 
 ENTRYPOINT ["/opt/unit-test"]
+CMD []
+
+# =============================================================================
+# Stage: examples (lightweight image with echo_server + ping_client)
+# =============================================================================
+FROM ubuntu:24.04 AS examples
+
+ARG build_type=Release
+
+COPY --from=build /code/build/${build_type}/bin/echo_server /opt/echo_server
+COPY --from=build /code/build/${build_type}/bin/ping_client /opt/ping_client
+
+ENTRYPOINT ["/bin/bash"]
 CMD []

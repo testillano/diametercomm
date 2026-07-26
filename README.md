@@ -219,6 +219,49 @@ endif()
 target_link_libraries(foo PRIVATE ert_diametercomm::ert_diametercomm)
 ```
 
+## Examples
+
+The `examples/` directory contains minimal programs to test the library without external dependencies (no `diametercodec` needed):
+
+- **echo_server** -- Listens for Diameter peers and echoes every request back as an answer with `Result-Code = 2001` (SUCCESS).
+- **ping_client** -- Connects to a Diameter peer, sends a single request and prints the response.
+
+### Building examples image
+
+```bash
+$ docker build --target examples -t ghcr.io/testillano/diametercomm_examples:latest .
+```
+
+### Running
+
+Using the convenience script `./examples.sh`:
+
+Terminal 1 (server):
+
+```bash
+$ ./examples.sh echo_server 0.0.0.0 3868
+```
+
+Terminal 2 (client):
+
+```bash
+$ ./examples.sh ping_client 127.0.0.1 3868 272
+```
+
+Or directly with docker (uses `--network host` so both containers share localhost):
+
+```bash
+$ docker run --rm -it --network host --entrypoint /opt/echo_server \
+         ghcr.io/testillano/diametercomm_examples:latest 0.0.0.0 3868
+```
+
+```bash
+$ docker run --rm -it --network host --entrypoint /opt/ping_client \
+         ghcr.io/testillano/diametercomm_examples:latest 127.0.0.1 3868 272
+```
+
+The client will connect, perform CER/CEA, send a request with the given command code, print the answer and exit.
+
 ## Contributing
 
 Please, execute `astyle` formatting (using [frankwolf image](https://hub.docker.com/r/frankwolf/astyle)) before any pull request:

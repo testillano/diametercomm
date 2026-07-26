@@ -6,3 +6,5 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 coverage
+CMakeDoxyfile.in
+CMakeDoxygenDefaults.cmake

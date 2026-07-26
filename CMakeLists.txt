@@ -69,6 +69,11 @@ if(MAIN_PROJECT)
   add_subdirectory(ut)
 endif()
 
+option(BUILD_EXAMPLES "Build example programs" OFF)
+if(BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
+
 ###########
 # Install #
 ###########
