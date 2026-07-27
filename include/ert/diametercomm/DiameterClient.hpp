@@ -44,8 +44,11 @@ Copyright (c) 2024 Eduardo Ramos
 
 #pragma once
 
+#include <boost/asio.hpp>
 #include <chrono>
 #include <cstdint>
+#include <ert/diametercomm/Peer.hpp>
+#include <ert/metrics/Metrics.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -53,14 +56,8 @@ Copyright (c) 2024 Eduardo Ramos
 #include <unordered_map>
 #include <vector>
 
-#include <boost/asio.hpp>
-
-#include <ert/diametercomm/Peer.hpp>
-
-namespace ert
-{
-namespace diametercomm
-{
+namespace ert {
+namespace diametercomm {
 
 /**
  * Diameter client: connects to a remote peer and sends requests.
@@ -78,7 +75,7 @@ namespace diametercomm
  *   client.send(request, [](const Buffer& answer) { ... }, timeout);
  */
 class DiameterClient {
-public:
+   public:
     using Buffer = Peer::Buffer;
     using ResponseCallback = std::function<void(const Buffer& response)>;
     using TimeoutCallback = std::function<void(uint32_t hopByHop)>;
@@ -115,8 +112,7 @@ public:
      * @param timeoutMs  Timeout in milliseconds (0 = no timeout)
      * @return hop-by-hop ID used, or 0 if send failed (not connected)
      */
-    uint32_t send(Buffer request, ResponseCallback onResponse,
-                  uint32_t timeoutMs = 5000);
+    uint32_t send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs = 5000);
 
     /**
      * Graceful disconnect (DPR/DPA).
@@ -148,14 +144,25 @@ public:
 
     // --- Reconnect configuration ---
     void setReconnectEnabled(bool enabled) { reconnectEnabled_ = enabled; }
-    void setReconnectBackoff(std::chrono::milliseconds initial,
-                             std::chrono::milliseconds max) {
+    void setReconnectBackoff(std::chrono::milliseconds initial, std::chrono::milliseconds max) {
         reconnectInitial_ = initial;
         reconnectMax_ = max;
     }
 
-private:
+    // --- Metrics ---
 
+    /**
+     * Enable prometheus metrics for the diameter client.
+     * Must be called before connect(). Metrics are optional -- if not enabled,
+     * no overhead is incurred (nullptr checks guard all metric operations).
+     *
+     * @param metrics  Pointer to the ert::metrics::Metrics instance (registry/exposer).
+     * @param source   Label value for the "source" prometheus label. If empty,
+     *                 defaults to "diameter_client".
+     */
+    void enableMetrics(ert::metrics::Metrics* metrics, const std::string& source = "");
+
+   private:
     void onPeerState(std::shared_ptr<Peer> peer, Peer::State state);
     void onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg);
     void scheduleReconnect();
@@ -187,7 +194,17 @@ private:
     RequestCallback onRequest_;
     StateCallback onState_;
     TimeoutCallback onTimeout_;
+
+    // --- Metrics members ---
+    ert::metrics::Metrics* metrics_{};
+    std::string source_{};
+
+    ert::metrics::counter_family_t* requests_sent_counter_family_ptr_{};
+    ert::metrics::counter_family_t* answers_received_counter_family_ptr_{};
+    ert::metrics::counter_family_t* requests_timedout_counter_family_ptr_{};
+    ert::metrics::counter_family_t* requests_unsent_counter_family_ptr_{};
+    ert::metrics::gauge_family_t* peer_state_gauge_family_ptr_{};
 };
 
-} // namespace diametercomm
-} // namespace ert
+}  // namespace diametercomm
+}  // namespace ert

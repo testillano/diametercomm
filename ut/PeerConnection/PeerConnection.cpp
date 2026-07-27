@@ -1,9 +1,8 @@
-#include <ert/diametercomm/PeerConnection.hpp>
-
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <ert/diametercomm/PeerConnection.hpp>
 #include <vector>
 
 using namespace ert::diametercomm;
@@ -12,14 +11,21 @@ using namespace ert::diametercomm;
 static PeerConnection::Buffer buildMinimalMessage(uint32_t hbh = 0x12345678) {
     PeerConnection::Buffer msg(20, 0);
     msg[0] = 1;
-    msg[1] = 0; msg[2] = 0; msg[3] = 20;
+    msg[1] = 0;
+    msg[2] = 0;
+    msg[3] = 20;
     msg[4] = 0x80;
-    msg[5] = 0; msg[6] = 1; msg[7] = 0x18; // DWR = 280
+    msg[5] = 0;
+    msg[6] = 1;
+    msg[7] = 0x18;  // DWR = 280
     msg[12] = static_cast<uint8_t>(hbh >> 24);
     msg[13] = static_cast<uint8_t>(hbh >> 16);
     msg[14] = static_cast<uint8_t>(hbh >> 8);
     msg[15] = static_cast<uint8_t>(hbh);
-    msg[16] = 0xDE; msg[17] = 0xAD; msg[18] = 0xBE; msg[19] = 0xEF;
+    msg[16] = 0xDE;
+    msg[17] = 0xAD;
+    msg[18] = 0xBE;
+    msg[19] = 0xEF;
     return msg;
 }
 
@@ -31,21 +37,22 @@ static PeerConnection::Buffer buildMessageWithPayload(size_t payloadSize) {
     msg[2] = static_cast<uint8_t>(totalLen >> 8);
     msg[3] = static_cast<uint8_t>(totalLen);
     msg[4] = 0x80;
-    msg[5] = 0; msg[6] = 1; msg[7] = 0x01;
+    msg[5] = 0;
+    msg[6] = 1;
+    msg[7] = 0x01;
     for (size_t i = 20; i < totalLen; ++i) msg[i] = static_cast<uint8_t>(i & 0xFF);
     return msg;
 }
 
 class PeerConnection_test : public ::testing::Test {
-protected:
+   protected:
     boost::asio::io_context io_;
     std::unique_ptr<boost::asio::ip::tcp::acceptor> acceptor_;
     uint16_t port_{0};
 
     void SetUp() override {
         acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(
-            io_, boost::asio::ip::tcp::endpoint(
-                boost::asio::ip::address::from_string("127.0.0.1"), 0));
+            io_, boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string("127.0.0.1"), 0));
         port_ = acceptor_->local_endpoint().port();
     }
 
@@ -65,21 +72,20 @@ TEST_F(PeerConnection_test, SendReceiveSingleMessage) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec) << ec.message();
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            serverConn->startReading(
-                [&](PeerConnection::Buffer&& msg) {
-                    received = std::move(msg);
-                    messageReceived = true;
-                },
-                [](const boost::system::error_code&) {});
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec) << ec.message();
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        serverConn->startReading(
+            [&](PeerConnection::Buffer&& msg) {
+                received = std::move(msg);
+                messageReceived = true;
+            },
+            [](const boost::system::error_code&) {});
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_,
-        [&]() { clientConn->asyncWrite(expectedMsg); },
+    clientConn->asyncConnect(
+        "127.0.0.1", port_, [&]() { clientConn->asyncWrite(expectedMsg); },
         [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 
     runFor(std::chrono::milliseconds(500));
@@ -95,18 +101,19 @@ TEST_F(PeerConnection_test, SendReceiveMultipleMessages) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            serverConn->startReading(
-                [&](PeerConnection::Buffer&& msg) { received.push_back(std::move(msg)); },
-                [](const boost::system::error_code&) {});
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        serverConn->startReading([&](PeerConnection::Buffer&& msg) { received.push_back(std::move(msg)); },
+                                 [](const boost::system::error_code&) {});
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_,
-        [&]() { for (const auto& m : sent) clientConn->asyncWrite(m); },
+    clientConn->asyncConnect(
+        "127.0.0.1", port_,
+        [&]() {
+            for (const auto& m : sent) clientConn->asyncWrite(m);
+        },
         [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 
     runFor(std::chrono::milliseconds(500));
@@ -122,18 +129,20 @@ TEST_F(PeerConnection_test, SendReceiveLargeMessage) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            serverConn->startReading(
-                [&](PeerConnection::Buffer&& msg) { received = std::move(msg); done = true; },
-                [](const boost::system::error_code&) {});
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        serverConn->startReading(
+            [&](PeerConnection::Buffer&& msg) {
+                received = std::move(msg);
+                done = true;
+            },
+            [](const boost::system::error_code&) {});
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_,
-        [&]() { clientConn->asyncWrite(largeMsg); },
+    clientConn->asyncConnect(
+        "127.0.0.1", port_, [&]() { clientConn->asyncWrite(largeMsg); },
         [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 
     runFor(std::chrono::milliseconds(500));
@@ -147,18 +156,16 @@ TEST_F(PeerConnection_test, ConnectionCloseTriggersError) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            serverConn->startReading(
-                [](PeerConnection::Buffer&&) {},
-                [&](const boost::system::error_code&) { errorReceived = true; });
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        serverConn->startReading([](PeerConnection::Buffer&&) {},
+                                 [&](const boost::system::error_code&) { errorReceived = true; });
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_,
-        [&]() { clientConn->close(); },
+    clientConn->asyncConnect(
+        "127.0.0.1", port_, [&]() { clientConn->close(); },
         [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 
     runFor(std::chrono::milliseconds(500));
@@ -172,8 +179,8 @@ TEST_F(PeerConnection_test, IsOpenAndClose) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     acceptor_->async_accept(*serverSock, [&](const boost::system::error_code&) {});
 
-    clientConn->asyncConnect("127.0.0.1", port_,
-        [&]() { connected = true; },
+    clientConn->asyncConnect(
+        "127.0.0.1", port_, [&]() { connected = true; },
         [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 
     runFor(std::chrono::milliseconds(200));
@@ -190,17 +197,16 @@ TEST_F(PeerConnection_test, RemoteEndpoint) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            endpoint = serverConn->remoteEndpoint();
-            done = true;
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        endpoint = serverConn->remoteEndpoint();
+        done = true;
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_, []() {},
-        [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
+    clientConn->asyncConnect(
+        "127.0.0.1", port_, []() {}, [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 
     runFor(std::chrono::milliseconds(200));
     ASSERT_TRUE(done);
@@ -216,23 +222,26 @@ TEST_F(PeerConnection_test, BidirectionalCommunication) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            serverConn->startReading(
-                [&](PeerConnection::Buffer&& msg) {
-                    serverReceived = std::move(msg);
-                    serverConn->asyncWrite(response);
-                },
-                [](const boost::system::error_code&) {});
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        serverConn->startReading(
+            [&](PeerConnection::Buffer&& msg) {
+                serverReceived = std::move(msg);
+                serverConn->asyncWrite(response);
+            },
+            [](const boost::system::error_code&) {});
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_,
+    clientConn->asyncConnect(
+        "127.0.0.1", port_,
         [&]() {
             clientConn->startReading(
-                [&](PeerConnection::Buffer&& msg) { clientReceived = std::move(msg); done = true; },
+                [&](PeerConnection::Buffer&& msg) {
+                    clientReceived = std::move(msg);
+                    done = true;
+                },
                 [](const boost::system::error_code&) {});
             clientConn->asyncWrite(request);
         },
@@ -250,22 +259,20 @@ TEST_F(PeerConnection_test, InvalidMessageLengthTriggersError) {
     auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
     std::shared_ptr<PeerConnection> serverConn;
 
-    acceptor_->async_accept(*serverSock,
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
-            serverConn->startReading(
-                [](PeerConnection::Buffer&&) { FAIL() << "Should not receive"; },
-                [&](const boost::system::error_code&) { errorReceived = true; });
-        });
+    acceptor_->async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock));
+        serverConn->startReading([](PeerConnection::Buffer&&) { FAIL() << "Should not receive"; },
+                                 [&](const boost::system::error_code&) { errorReceived = true; });
+    });
 
     auto clientConn = std::make_shared<PeerConnection>(io_);
-    clientConn->asyncConnect("127.0.0.1", port_,
+    clientConn->asyncConnect(
+        "127.0.0.1", port_,
         [&]() {
-            PeerConnection::Buffer bad = {0x01, 0x00, 0x00, 0x0A}; // length=10 < 20
-            boost::asio::async_write(clientConn->socket(),
-                boost::asio::buffer(bad),
-                [](const boost::system::error_code&, std::size_t) {});
+            PeerConnection::Buffer bad = {0x01, 0x00, 0x00, 0x0A};  // length=10 < 20
+            boost::asio::async_write(clientConn->socket(), boost::asio::buffer(bad),
+                                     [](const boost::system::error_code&, std::size_t) {});
         },
         [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
 

@@ -1,9 +1,8 @@
-#include <ert/diametercomm/Peer.hpp>
-
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <ert/diametercomm/Peer.hpp>
 #include <thread>
 
 using namespace ert::diametercomm;
@@ -12,31 +11,28 @@ using namespace ert::diametercomm;
 // Test fixture: loopback server + client peer exchange
 // ============================================================================
 class Peer_test : public ::testing::Test {
-protected:
+   protected:
     boost::asio::io_context io_;
     std::unique_ptr<boost::asio::ip::tcp::acceptor> acceptor_;
     uint16_t port_{0};
 
     Peer::Config serverConfig() {
-        return {"server.example.com", "example.com", "127.0.0.1",
-                0, "TestServer", 0 /*no watchdog in tests*/, 16777238};
+        return {"server.example.com",       "example.com", "127.0.0.1", 0, "TestServer",
+                0 /*no watchdog in tests*/, 16777238};
     }
 
     Peer::Config clientConfig() {
-        return {"client.example.com", "example.com", "127.0.0.1",
-                0, "TestClient", 0 /*no watchdog in tests*/, 16777238};
+        return {"client.example.com",       "example.com", "127.0.0.1", 0, "TestClient",
+                0 /*no watchdog in tests*/, 16777238};
     }
 
     void SetUp() override {
         acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(
-            io_, boost::asio::ip::tcp::endpoint(
-                boost::asio::ip::address::from_string("127.0.0.1"), 0));
+            io_, boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string("127.0.0.1"), 0));
         port_ = acceptor_->local_endpoint().port();
     }
 
-    void TearDown() override {
-        acceptor_->close();
-    }
+    void TearDown() override { acceptor_->close(); }
 
     void runFor(std::chrono::milliseconds timeout) {
         io_.restart();
@@ -47,12 +43,19 @@ protected:
     static Peer::Buffer buildAppRequest(uint32_t hbh = 0, uint32_t e2e = 0) {
         Peer::Buffer msg(20, 0);
         msg[0] = 1;
-        msg[1] = 0; msg[2] = 0; msg[3] = 20;
-        msg[4] = 0x80; // R-bit
+        msg[1] = 0;
+        msg[2] = 0;
+        msg[3] = 20;
+        msg[4] = 0x80;  // R-bit
         // command code = 272 (Credit-Control)
-        msg[5] = 0; msg[6] = 1; msg[7] = 0x10;
+        msg[5] = 0;
+        msg[6] = 1;
+        msg[7] = 0x10;
         // app-id = 4 (Credit-Control)
-        msg[8] = 0; msg[9] = 0; msg[10] = 0; msg[11] = 4;
+        msg[8] = 0;
+        msg[9] = 0;
+        msg[10] = 0;
+        msg[11] = 4;
         // hbh
         msg[12] = static_cast<uint8_t>(hbh >> 24);
         msg[13] = static_cast<uint8_t>(hbh >> 16);
@@ -74,25 +77,21 @@ TEST_F(Peer_test, CerCeaExchange) {
     std::atomic<bool> clientOpen{false};
     std::atomic<bool> serverOpen{false};
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, serverConfig());
+    auto serverPeer = std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_,
+                                             serverConfig());
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec) << ec.message();
-            serverPeer->setStateCallback(
-                [&](std::shared_ptr<Peer>, Peer::State s) {
-                    if (s == Peer::State::Open) serverOpen = true;
-                });
-            serverPeer->start();
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec) << ec.message();
+        serverPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+            if (s == Peer::State::Open) serverOpen = true;
         });
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
-    clientPeer->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Open) clientOpen = true;
-        });
+    clientPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Open) clientOpen = true;
+    });
     clientPeer->connect("127.0.0.1", port_);
 
     runFor(std::chrono::milliseconds(500));
@@ -116,31 +115,27 @@ TEST_F(Peer_test, ApplicationMessageDelivery) {
     Peer::Buffer receivedMsg;
     std::atomic<bool> received{false};
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, serverConfig());
+    auto serverPeer = std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_,
+                                             serverConfig());
 
-    serverPeer->setRequestCallback(
-        [&](std::shared_ptr<Peer>, Peer::Buffer&& msg) {
-            receivedMsg = std::move(msg);
-            received = true;
-        });
+    serverPeer->setRequestCallback([&](std::shared_ptr<Peer>, Peer::Buffer&& msg) {
+        receivedMsg = std::move(msg);
+        received = true;
+    });
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverPeer->start();
-        });
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
-    clientPeer->setStateCallback(
-        [&](std::shared_ptr<Peer> p, Peer::State s) {
-            if (s == Peer::State::Open) {
-                // Send application message once open
-                auto appMsg = buildAppRequest();
-                p->send(std::move(appMsg));
-            }
-        });
+    clientPeer->setStateCallback([&](std::shared_ptr<Peer> p, Peer::State s) {
+        if (s == Peer::State::Open) {
+            // Send application message once open
+            auto appMsg = buildAppRequest();
+            p->send(std::move(appMsg));
+        }
+    });
     clientPeer->connect("127.0.0.1", port_);
 
     runFor(std::chrono::milliseconds(500));
@@ -148,15 +143,11 @@ TEST_F(Peer_test, ApplicationMessageDelivery) {
     ASSERT_TRUE(received);
     ASSERT_GE(receivedMsg.size(), 20u);
     // Command code should be 272
-    uint32_t cmdCode = (uint32_t(receivedMsg[5]) << 16) |
-                       (uint32_t(receivedMsg[6]) << 8) |
-                        uint32_t(receivedMsg[7]);
+    uint32_t cmdCode = (uint32_t(receivedMsg[5]) << 16) | (uint32_t(receivedMsg[6]) << 8) | uint32_t(receivedMsg[7]);
     EXPECT_EQ(cmdCode, 272u);
     // Hop-by-hop should have been auto-assigned (non-zero)
-    uint32_t hbh = (uint32_t(receivedMsg[12]) << 24) |
-                   (uint32_t(receivedMsg[13]) << 16) |
-                   (uint32_t(receivedMsg[14]) << 8) |
-                    uint32_t(receivedMsg[15]);
+    uint32_t hbh = (uint32_t(receivedMsg[12]) << 24) | (uint32_t(receivedMsg[13]) << 16) |
+                   (uint32_t(receivedMsg[14]) << 8) | uint32_t(receivedMsg[15]);
     EXPECT_NE(hbh, 0u);
 }
 
@@ -176,31 +167,27 @@ TEST_F(Peer_test, GracefulDisconnect) {
     std::atomic<bool> clientClosed{false};
     std::atomic<bool> serverClosed{false};
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, serverConfig());
+    auto serverPeer = std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_,
+                                             serverConfig());
 
-    serverPeer->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Closed) serverClosed = true;
-        });
+    serverPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Closed) serverClosed = true;
+    });
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverPeer->start();
-        });
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
-    clientPeer->setStateCallback(
-        [&](std::shared_ptr<Peer> p, Peer::State s) {
-            if (s == Peer::State::Open) {
-                // Immediately disconnect
-                p->disconnect(0); // REBOOTING
-            } else if (s == Peer::State::Closed) {
-                clientClosed = true;
-            }
-        });
+    clientPeer->setStateCallback([&](std::shared_ptr<Peer> p, Peer::State s) {
+        if (s == Peer::State::Open) {
+            // Immediately disconnect
+            p->disconnect(0);  // REBOOTING
+        } else if (s == Peer::State::Closed) {
+            clientClosed = true;
+        }
+    });
     clientPeer->connect("127.0.0.1", port_);
 
     runFor(std::chrono::milliseconds(500));
@@ -218,25 +205,22 @@ TEST_F(Peer_test, WatchdogExchange) {
     auto sConfig = serverConfig();
     sConfig.watchdogIntervalSec = 1;
     auto cConfig = clientConfig();
-    cConfig.watchdogIntervalSec = 0; // only server sends DWR
+    cConfig.watchdogIntervalSec = 0;  // only server sends DWR
 
     std::atomic<bool> bothOpen{false};
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, sConfig);
+    auto serverPeer =
+        std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_, sConfig);
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverPeer->start();
-        });
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, cConfig);
-    clientPeer->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Open) bothOpen = true;
-        });
+    clientPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Open) bothOpen = true;
+    });
     clientPeer->connect("127.0.0.1", port_);
 
     // Run for 1.5 seconds to allow at least one DWR/DWA exchange
@@ -258,21 +242,16 @@ TEST_F(Peer_test, WatchdogExchange) {
 TEST_F(Peer_test, StateTransitionsClient) {
     std::vector<Peer::State> states;
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, serverConfig());
+    auto serverPeer = std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_,
+                                             serverConfig());
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverPeer->start();
-        });
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
-    clientPeer->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            states.push_back(s);
-        });
+    clientPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) { states.push_back(s); });
     clientPeer->connect("127.0.0.1", port_);
 
     runFor(std::chrono::milliseconds(500));
@@ -289,20 +268,15 @@ TEST_F(Peer_test, StateTransitionsClient) {
 TEST_F(Peer_test, StateTransitionsServer) {
     std::vector<Peer::State> states;
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, serverConfig());
+    auto serverPeer = std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_,
+                                             serverConfig());
 
-    serverPeer->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            states.push_back(s);
-        });
+    serverPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) { states.push_back(s); });
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverPeer->start();
-        });
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
     clientPeer->connect("127.0.0.1", port_);
@@ -335,25 +309,22 @@ TEST_F(Peer_test, HopByHopAutoAssignment) {
 TEST_F(Peer_test, ForceClose) {
     std::atomic<bool> closed{false};
 
-    auto serverPeer = std::make_shared<Peer>(
-        std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)),
-        io_, serverConfig());
+    auto serverPeer = std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_,
+                                             serverConfig());
 
-    acceptor_->async_accept(serverPeer->socket(),
-        [&](const boost::system::error_code& ec) {
-            ASSERT_FALSE(ec);
-            serverPeer->start();
-        });
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec);
+        serverPeer->start();
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
-    clientPeer->setStateCallback(
-        [&](std::shared_ptr<Peer> p, Peer::State s) {
-            if (s == Peer::State::Open) {
-                p->close(); // force close, no DPR
-            } else if (s == Peer::State::Closed) {
-                closed = true;
-            }
-        });
+    clientPeer->setStateCallback([&](std::shared_ptr<Peer> p, Peer::State s) {
+        if (s == Peer::State::Open) {
+            p->close();  // force close, no DPR
+        } else if (s == Peer::State::Closed) {
+            closed = true;
+        }
+    });
     clientPeer->connect("127.0.0.1", port_);
 
     runFor(std::chrono::milliseconds(500));

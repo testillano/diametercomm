@@ -14,17 +14,15 @@
 |___________________________________________________________________________|
 */
 
+#include <boost/asio.hpp>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
-#include <string>
-
-#include <boost/asio.hpp>
-
 #include <ert/diametercomm/DiameterServer.hpp>
 #include <ert/diametercomm/Peer.hpp>
+#include <iostream>
+#include <string>
 
 namespace {
 
@@ -49,7 +47,7 @@ using Buffer = ert::diametercomm::Peer::Buffer;
  */
 Buffer buildAnswer(const Buffer& request) {
     if (request.size() < HEADER_SIZE) {
-        return {}; // malformed
+        return {};  // malformed
     }
 
     // Start with a copy of the request
@@ -99,9 +97,7 @@ Buffer buildAnswer(const Buffer& request) {
  */
 uint32_t commandCode(const Buffer& msg) {
     if (msg.size() < HEADER_SIZE) return 0;
-    return (static_cast<uint32_t>(msg[5]) << 16) |
-           (static_cast<uint32_t>(msg[6]) << 8) |
-           static_cast<uint32_t>(msg[7]);
+    return (static_cast<uint32_t>(msg[5]) << 16) | (static_cast<uint32_t>(msg[6]) << 8) | static_cast<uint32_t>(msg[7]);
 }
 
 boost::asio::io_context* g_io = nullptr;
@@ -113,7 +109,7 @@ void signalHandler(int /*sig*/) {
     }
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 int main(int argc, char* argv[]) {
     std::string bindAddr = "0.0.0.0";
@@ -140,14 +136,13 @@ int main(int argc, char* argv[]) {
     config.vendorId = 0;
     config.productName = "diametercomm-echo-server";
     config.watchdogIntervalSec = 30;
-    config.applicationId = 0; // relay (accepts any)
+    config.applicationId = 0;  // relay (accepts any)
 
     ert::diametercomm::DiameterServer server(io, config);
 
     // Log peer events
     server.setPeerEventCallback(
-        [](std::shared_ptr<ert::diametercomm::Peer> peer,
-           ert::diametercomm::Peer::State state) {
+        [](std::shared_ptr<ert::diametercomm::Peer> peer, ert::diametercomm::Peer::State state) {
             const char* stateStr = "unknown";
             switch (state) {
                 case ert::diametercomm::Peer::State::Open:
@@ -166,24 +161,21 @@ int main(int argc, char* argv[]) {
                     stateStr = "Closing";
                     break;
             }
-            std::cout << "[echo_server] Peer " << peer->remoteOriginHost()
-                      << " -> " << stateStr << "\n";
+            std::cout << "[echo_server] Peer " << peer->remoteOriginHost() << " -> " << stateStr << "\n";
         });
 
     // Echo every request back as an answer
-    server.setRequestCallback(
-        [](std::shared_ptr<ert::diametercomm::Peer> peer, Buffer&& request) {
-            uint32_t cc = commandCode(request);
-            std::cout << "[echo_server] Request from " << peer->remoteOriginHost()
-                      << " command-code=" << cc
-                      << " size=" << request.size() << " bytes\n";
+    server.setRequestCallback([](std::shared_ptr<ert::diametercomm::Peer> peer, Buffer&& request) {
+        uint32_t cc = commandCode(request);
+        std::cout << "[echo_server] Request from " << peer->remoteOriginHost() << " command-code=" << cc
+                  << " size=" << request.size() << " bytes\n";
 
-            Buffer answer = buildAnswer(request);
-            if (!answer.empty()) {
-                peer->send(std::move(answer));
-                std::cout << "[echo_server] Answer sent (Result-Code=2001)\n";
-            }
-        });
+        Buffer answer = buildAnswer(request);
+        if (!answer.empty()) {
+            peer->send(std::move(answer));
+            std::cout << "[echo_server] Answer sent (Result-Code=2001)\n";
+        }
+    });
 
     server.listen(bindAddr, port);
 

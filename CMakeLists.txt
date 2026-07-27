@@ -62,6 +62,27 @@ endif()
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(Threads REQUIRED)
 
+# ert_metrics (prometheus-cpp based metrics library)
+find_library(ERT_METRICS_LIBRARY ert_metrics PATHS ${CMAKE_PREFIX_PATH}/lib/ert)
+if(NOT ERT_METRICS_LIBRARY)
+    message(STATUS "ert_metrics library not found at ${CMAKE_PREFIX_PATH}/lib/ert - metrics support disabled")
+endif()
+
+# prometheus-cpp (transitive dependency of ert_metrics)
+find_library(PROMETHEUS_PULL_LIBRARY prometheus-cpp-pull PATHS ${CMAKE_PREFIX_PATH}/lib)
+find_library(PROMETHEUS_CORE_LIBRARY prometheus-cpp-core PATHS ${CMAKE_PREFIX_PATH}/lib)
+find_library(ZLIB_LIBRARY z)
+
+# Create imported target for ert_metrics with its transitive deps
+if(ERT_METRICS_LIBRARY)
+    add_library(ert_metrics STATIC IMPORTED)
+    set_target_properties(ert_metrics PROPERTIES
+        IMPORTED_LOCATION ${ERT_METRICS_LIBRARY}
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_PREFIX_PATH}/include
+        INTERFACE_LINK_LIBRARIES "${PROMETHEUS_PULL_LIBRARY};${PROMETHEUS_CORE_LIBRARY};${ZLIB_LIBRARY}"
+    )
+endif()
+
 ###########
 # Install #
 ###########

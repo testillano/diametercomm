@@ -17,16 +17,14 @@ SPDX-License-Identifier: MIT
 Copyright (c) 2024 Eduardo Ramos
 */
 
+#include <arpa/inet.h>
+
+#include <chrono>
+#include <cstring>
 #include <ert/diametercomm/Peer.hpp>
 
-#include <cstring>
-#include <arpa/inet.h>
-#include <chrono>
-
-namespace ert
-{
-namespace diametercomm
-{
+namespace ert {
+namespace diametercomm {
 
 // Diameter base protocol command codes
 static constexpr uint32_t CMD_CER = 257;
@@ -37,14 +35,14 @@ static constexpr uint32_t CMD_DPR = 282;
 static constexpr uint8_t FLAG_REQUEST = 0x80;
 
 // Diameter AVP codes (base protocol)
-static constexpr uint32_t AVP_ORIGIN_HOST      = 264;
-static constexpr uint32_t AVP_ORIGIN_REALM     = 296;
-static constexpr uint32_t AVP_HOST_IP_ADDRESS  = 257;
-static constexpr uint32_t AVP_VENDOR_ID        = 266;
-static constexpr uint32_t AVP_PRODUCT_NAME     = 269;
-static constexpr uint32_t AVP_RESULT_CODE      = 268;
+static constexpr uint32_t AVP_ORIGIN_HOST = 264;
+static constexpr uint32_t AVP_ORIGIN_REALM = 296;
+static constexpr uint32_t AVP_HOST_IP_ADDRESS = 257;
+static constexpr uint32_t AVP_VENDOR_ID = 266;
+static constexpr uint32_t AVP_PRODUCT_NAME = 269;
+static constexpr uint32_t AVP_RESULT_CODE = 268;
 static constexpr uint32_t AVP_DISCONNECT_CAUSE = 273;
-static constexpr uint32_t AVP_AUTH_APP_ID      = 258;
+static constexpr uint32_t AVP_AUTH_APP_ID = 258;
 
 // Result codes
 static constexpr uint32_t DIAMETER_SUCCESS = 2001;
@@ -59,9 +57,8 @@ using Buffer = Peer::Buffer;
 
 namespace {
 
-void appendAvp(Buffer& buf, uint32_t code, uint8_t flags,
-               const uint8_t* data, uint32_t dataLen) {
-    uint32_t avpLen = 8 + dataLen; // header(8) + data
+void appendAvp(Buffer& buf, uint32_t code, uint8_t flags, const uint8_t* data, uint32_t dataLen) {
+    uint32_t avpLen = 8 + dataLen;  // header(8) + data
     // Code
     buf.push_back(static_cast<uint8_t>(code >> 24));
     buf.push_back(static_cast<uint8_t>(code >> 16));
@@ -80,11 +77,8 @@ void appendAvp(Buffer& buf, uint32_t code, uint8_t flags,
     for (uint32_t i = 0; i < pad; ++i) buf.push_back(0);
 }
 
-void appendStringAvp(Buffer& buf, uint32_t code, uint8_t flags,
-                     const std::string& value) {
-    appendAvp(buf, code, flags,
-              reinterpret_cast<const uint8_t*>(value.data()),
-              static_cast<uint32_t>(value.size()));
+void appendStringAvp(Buffer& buf, uint32_t code, uint8_t flags, const std::string& value) {
+    appendAvp(buf, code, flags, reinterpret_cast<const uint8_t*>(value.data()), static_cast<uint32_t>(value.size()));
 }
 
 void appendUint32Avp(Buffer& buf, uint32_t code, uint8_t flags, uint32_t value) {
@@ -96,28 +90,33 @@ void appendUint32Avp(Buffer& buf, uint32_t code, uint8_t flags, uint32_t value) 
     appendAvp(buf, code, flags, data, 4);
 }
 
-void appendAddressAvp(Buffer& buf, uint32_t code, uint8_t flags,
-                      const std::string& addr) {
+void appendAddressAvp(Buffer& buf, uint32_t code, uint8_t flags, const std::string& addr) {
     uint8_t ipv4[4];
-    uint8_t data[6]; // family(2) + ipv4(4)
+    uint8_t data[6];  // family(2) + ipv4(4)
     if (inet_pton(AF_INET, addr.c_str(), ipv4) == 1) {
-        data[0] = 0; data[1] = 1; // IPv4 family
+        data[0] = 0;
+        data[1] = 1;  // IPv4 family
         std::memcpy(data + 2, ipv4, 4);
         appendAvp(buf, code, flags, data, 6);
     } else {
         // Fallback: encode 0.0.0.0
-        data[0] = 0; data[1] = 1;
-        data[2] = 0; data[3] = 0; data[4] = 0; data[5] = 0;
+        data[0] = 0;
+        data[1] = 1;
+        data[2] = 0;
+        data[3] = 0;
+        data[4] = 0;
+        data[5] = 0;
         appendAvp(buf, code, flags, data, 6);
     }
 }
 
 // Write 20-byte message header
-void writeMessageHeader(Buffer& buf, uint8_t flags, uint32_t code,
-                        uint32_t appId, uint32_t hbh, uint32_t e2e) {
-    buf.push_back(1); // version
+void writeMessageHeader(Buffer& buf, uint8_t flags, uint32_t code, uint32_t appId, uint32_t hbh, uint32_t e2e) {
+    buf.push_back(1);  // version
     // length placeholder (filled later)
-    buf.push_back(0); buf.push_back(0); buf.push_back(0);
+    buf.push_back(0);
+    buf.push_back(0);
+    buf.push_back(0);
     buf.push_back(flags);
     // command code (3 bytes)
     buf.push_back(static_cast<uint8_t>(code >> 16));
@@ -150,73 +149,56 @@ void fixMessageLength(Buffer& buf) {
 
 // Extract a string AVP value by code from raw message buffer
 std::string extractStringAvp(const Buffer& msg, uint32_t avpCode) {
-    size_t pos = 20; // skip message header
+    size_t pos = 20;  // skip message header
     while (pos + 8 <= msg.size()) {
-        uint32_t code = (uint32_t(msg[pos]) << 24) | (uint32_t(msg[pos+1]) << 16) |
-                        (uint32_t(msg[pos+2]) << 8) | uint32_t(msg[pos+3]);
-        uint32_t avpLen = (uint32_t(msg[pos+5]) << 16) |
-                          (uint32_t(msg[pos+6]) << 8) | uint32_t(msg[pos+7]);
-        uint32_t headerLen = (msg[pos+4] & 0x80) ? 12 : 8; // vendor bit?
+        uint32_t code = (uint32_t(msg[pos]) << 24) | (uint32_t(msg[pos + 1]) << 16) | (uint32_t(msg[pos + 2]) << 8) |
+                        uint32_t(msg[pos + 3]);
+        uint32_t avpLen = (uint32_t(msg[pos + 5]) << 16) | (uint32_t(msg[pos + 6]) << 8) | uint32_t(msg[pos + 7]);
+        uint32_t headerLen = (msg[pos + 4] & 0x80) ? 12 : 8;  // vendor bit?
 
         if (avpLen < headerLen || pos + avpLen > msg.size()) break;
 
         if (code == avpCode) {
             uint32_t dataLen = avpLen - headerLen;
-            return std::string(reinterpret_cast<const char*>(msg.data() + pos + headerLen),
-                               dataLen);
+            return std::string(reinterpret_cast<const char*>(msg.data() + pos + headerLen), dataLen);
         }
 
-        pos += ((avpLen + 3) / 4) * 4; // padded
+        pos += ((avpLen + 3) / 4) * 4;  // padded
     }
     return "";
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // Construction
 // ============================================================================
 
 Peer::Peer(boost::asio::io_context& io, const Config& config)
-    : io_(io)
-    , connection_(std::make_shared<PeerConnection>(io))
-    , config_(config)
-    , watchdogTimer_(io)
-{
-}
+    : io_(io), connection_(std::make_shared<PeerConnection>(io)), config_(config), watchdogTimer_(io) {}
 
-Peer::Peer(std::shared_ptr<PeerConnection> connection,
-           boost::asio::io_context& io, const Config& config)
-    : io_(io)
-    , connection_(std::move(connection))
-    , config_(config)
-    , watchdogTimer_(io)
-{
-}
+Peer::Peer(std::shared_ptr<PeerConnection> connection, boost::asio::io_context& io, const Config& config)
+    : io_(io), connection_(std::move(connection)), config_(config), watchdogTimer_(io) {}
 
-Peer::~Peer() {
-    stopWatchdog();
-}
+Peer::~Peer() { stopWatchdog(); }
 
 // ============================================================================
 // connect (client-side)
 // ============================================================================
 void Peer::connect(const std::string& host, uint16_t port) {
     auto self = shared_from_this();
-    connection_->asyncConnect(host, port,
+    connection_->asyncConnect(
+        host, port,
         [self]() {
             // Connected: send CER
             self->setState(State::WaitCEA);
             auto cer = self->buildCER();
             self->connection_->asyncWrite(std::move(cer));
             // Start reading
-            self->connection_->startReading(
-                [self](Buffer&& msg) { self->onMessage(std::move(msg)); },
-                [self](const boost::system::error_code& ec) { self->onError(ec); });
+            self->connection_->startReading([self](Buffer&& msg) { self->onMessage(std::move(msg)); },
+                                            [self](const boost::system::error_code& ec) { self->onError(ec); });
         },
-        [self](const boost::system::error_code& ec) {
-            self->onError(ec);
-        });
+        [self](const boost::system::error_code& ec) { self->onError(ec); });
 }
 
 // ============================================================================
@@ -225,9 +207,8 @@ void Peer::connect(const std::string& host, uint16_t port) {
 void Peer::start() {
     setState(State::WaitCER);
     auto self = shared_from_this();
-    connection_->startReading(
-        [self](Buffer&& msg) { self->onMessage(std::move(msg)); },
-        [self](const boost::system::error_code& ec) { self->onError(ec); });
+    connection_->startReading([self](Buffer&& msg) { self->onMessage(std::move(msg)); },
+                              [self](const boost::system::error_code& ec) { self->onError(ec); });
 }
 
 // ============================================================================
@@ -266,8 +247,7 @@ void Peer::disconnect(uint32_t disconnectCause) {
     stopWatchdog();
 
     Buffer dpr;
-    writeMessageHeader(dpr, FLAG_REQUEST, CMD_DPR, 0,
-                       nextHopByHop(), nextEndToEnd());
+    writeMessageHeader(dpr, FLAG_REQUEST, CMD_DPR, 0, nextHopByHop(), nextEndToEnd());
     appendStringAvp(dpr, AVP_ORIGIN_HOST, AVP_FLAG_MANDATORY, config_.originHost);
     appendStringAvp(dpr, AVP_ORIGIN_REALM, AVP_FLAG_MANDATORY, config_.originRealm);
     appendUint32Avp(dpr, AVP_DISCONNECT_CAUSE, AVP_FLAG_MANDATORY, disconnectCause);
@@ -289,7 +269,7 @@ void Peer::close() {
 // onMessage - route incoming messages to appropriate handler
 // ============================================================================
 void Peer::onMessage(Buffer&& msg) {
-    if (msg.size() < 20) return; // invalid
+    if (msg.size() < 20) return;  // invalid
 
     uint32_t cmdCode = extractCommandCode(msg);
     bool request = isRequest(msg);
@@ -374,9 +354,7 @@ void Peer::handleDWA(const Buffer& /*msg*/) {
 void Peer::handleDPR(const Buffer& msg) {
     auto dpa = buildDPA(msg);
     auto self = shared_from_this();
-    connection_->asyncWrite(std::move(dpa), [self]() {
-        self->close();
-    });
+    connection_->asyncWrite(std::move(dpa), [self]() { self->close(); });
 }
 
 // ============================================================================
@@ -392,8 +370,7 @@ void Peer::handleDPA(const Buffer& /*msg*/) {
 // ============================================================================
 Peer::Buffer Peer::buildCER() const {
     Buffer msg;
-    writeMessageHeader(msg, FLAG_REQUEST, CMD_CER, 0,
-                       const_cast<Peer*>(this)->nextHopByHop(),
+    writeMessageHeader(msg, FLAG_REQUEST, CMD_CER, 0, const_cast<Peer*>(this)->nextHopByHop(),
                        const_cast<Peer*>(this)->nextEndToEnd());
 
     appendStringAvp(msg, AVP_ORIGIN_HOST, AVP_FLAG_MANDATORY, config_.originHost);
@@ -401,8 +378,10 @@ Peer::Buffer Peer::buildCER() const {
     appendAddressAvp(msg, AVP_HOST_IP_ADDRESS, AVP_FLAG_MANDATORY, config_.hostIpAddress);
     appendUint32Avp(msg, AVP_VENDOR_ID, AVP_FLAG_MANDATORY, config_.vendorId);
     appendStringAvp(msg, AVP_PRODUCT_NAME, 0, config_.productName);
-    if (config_.applicationId != 0) {
-        appendUint32Avp(msg, AVP_AUTH_APP_ID, AVP_FLAG_MANDATORY, config_.applicationId);
+    for (uint32_t appId : config_.applicationIds) {
+        if (appId != 0) {
+            appendUint32Avp(msg, AVP_AUTH_APP_ID, AVP_FLAG_MANDATORY, appId);
+        }
     }
     fixMessageLength(msg);
     return msg;
@@ -424,8 +403,10 @@ Peer::Buffer Peer::buildCEA(const Buffer& cer) const {
     appendAddressAvp(msg, AVP_HOST_IP_ADDRESS, AVP_FLAG_MANDATORY, config_.hostIpAddress);
     appendUint32Avp(msg, AVP_VENDOR_ID, AVP_FLAG_MANDATORY, config_.vendorId);
     appendStringAvp(msg, AVP_PRODUCT_NAME, 0, config_.productName);
-    if (config_.applicationId != 0) {
-        appendUint32Avp(msg, AVP_AUTH_APP_ID, AVP_FLAG_MANDATORY, config_.applicationId);
+    for (uint32_t appId : config_.applicationIds) {
+        if (appId != 0) {
+            appendUint32Avp(msg, AVP_AUTH_APP_ID, AVP_FLAG_MANDATORY, appId);
+        }
     }
     fixMessageLength(msg);
     return msg;
@@ -436,8 +417,7 @@ Peer::Buffer Peer::buildCEA(const Buffer& cer) const {
 // ============================================================================
 Peer::Buffer Peer::buildDWR() {
     Buffer msg;
-    writeMessageHeader(msg, FLAG_REQUEST, CMD_DWR, 0,
-                       nextHopByHop(), nextEndToEnd());
+    writeMessageHeader(msg, FLAG_REQUEST, CMD_DWR, 0, nextHopByHop(), nextEndToEnd());
     appendStringAvp(msg, AVP_ORIGIN_HOST, AVP_FLAG_MANDATORY, config_.originHost);
     appendStringAvp(msg, AVP_ORIGIN_REALM, AVP_FLAG_MANDATORY, config_.originRealm);
     fixMessageLength(msg);
@@ -483,21 +463,18 @@ void Peer::startWatchdog() {
     if (config_.watchdogIntervalSec == 0) return;
 
     auto self = shared_from_this();
-    watchdogTimer_.expires_after(
-        std::chrono::seconds(config_.watchdogIntervalSec));
+    watchdogTimer_.expires_after(std::chrono::seconds(config_.watchdogIntervalSec));
     watchdogTimer_.async_wait([self](const boost::system::error_code& ec) {
-        if (ec) return; // cancelled
+        if (ec) return;  // cancelled
         if (self->state_ != State::Open) return;
 
         auto dwr = self->buildDWR();
         self->connection_->asyncWrite(std::move(dwr));
-        self->startWatchdog(); // reschedule
+        self->startWatchdog();  // reschedule
     });
 }
 
-void Peer::stopWatchdog() {
-    watchdogTimer_.cancel();
-}
+void Peer::stopWatchdog() { watchdogTimer_.cancel(); }
 
 // ============================================================================
 // setState
@@ -517,18 +494,14 @@ uint32_t Peer::extractCommandCode(const Buffer& msg) {
     return (uint32_t(msg[5]) << 16) | (uint32_t(msg[6]) << 8) | uint32_t(msg[7]);
 }
 
-bool Peer::isRequest(const Buffer& msg) {
-    return (msg[4] & FLAG_REQUEST) != 0;
-}
+bool Peer::isRequest(const Buffer& msg) { return (msg[4] & FLAG_REQUEST) != 0; }
 
 uint32_t Peer::extractHopByHop(const Buffer& msg) {
-    return (uint32_t(msg[12]) << 24) | (uint32_t(msg[13]) << 16) |
-           (uint32_t(msg[14]) << 8) | uint32_t(msg[15]);
+    return (uint32_t(msg[12]) << 24) | (uint32_t(msg[13]) << 16) | (uint32_t(msg[14]) << 8) | uint32_t(msg[15]);
 }
 
 uint32_t Peer::extractEndToEnd(const Buffer& msg) {
-    return (uint32_t(msg[16]) << 24) | (uint32_t(msg[17]) << 16) |
-           (uint32_t(msg[18]) << 8) | uint32_t(msg[19]);
+    return (uint32_t(msg[16]) << 24) | (uint32_t(msg[17]) << 16) | (uint32_t(msg[18]) << 8) | uint32_t(msg[19]);
 }
 
 void Peer::setHopByHop(Buffer& msg, uint32_t hbh) {
@@ -545,5 +518,5 @@ void Peer::setEndToEnd(Buffer& msg, uint32_t e2e) {
     msg[19] = static_cast<uint8_t>(e2e);
 }
 
-} // namespace diametercomm
-} // namespace ert
+}  // namespace diametercomm
+}  // namespace ert

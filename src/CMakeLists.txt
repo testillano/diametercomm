@@ -15,6 +15,7 @@ target_link_libraries(${ERT_DIAMETERCOMM_TARGET_NAME}
 PUBLIC
     Boost::system
     Threads::Threads
+    ert_metrics
 )
 
 install(TARGETS ${ERT_DIAMETERCOMM_TARGET_NAME}

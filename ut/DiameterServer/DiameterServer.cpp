@@ -1,24 +1,21 @@
-#include <ert/diametercomm/DiameterServer.hpp>
-
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <ert/diametercomm/DiameterServer.hpp>
 
 using namespace ert::diametercomm;
 
 class DiameterServer_test : public ::testing::Test {
-protected:
+   protected:
     boost::asio::io_context io_;
 
     Peer::Config serverConfig() {
-        return {"server.example.com", "example.com", "127.0.0.1",
-                0, "TestServer", 0, 16777238};
+        return {"server.example.com", "example.com", "127.0.0.1", 0, "TestServer", 0, 16777238};
     }
 
     Peer::Config clientConfig() {
-        return {"client.example.com", "example.com", "127.0.0.1",
-                0, "TestClient", 0, 16777238};
+        return {"client.example.com", "example.com", "127.0.0.1", 0, "TestClient", 0, 16777238};
     }
 
     void runFor(std::chrono::milliseconds timeout) {
@@ -30,10 +27,17 @@ protected:
     static Peer::Buffer buildAppRequest() {
         Peer::Buffer msg(20, 0);
         msg[0] = 1;
-        msg[1] = 0; msg[2] = 0; msg[3] = 20;
+        msg[1] = 0;
+        msg[2] = 0;
+        msg[3] = 20;
         msg[4] = 0x80;
-        msg[5] = 0; msg[6] = 1; msg[7] = 0x10;
-        msg[8] = 0; msg[9] = 0; msg[10] = 0; msg[11] = 4;
+        msg[5] = 0;
+        msg[6] = 1;
+        msg[7] = 0x10;
+        msg[8] = 0;
+        msg[9] = 0;
+        msg[10] = 0;
+        msg[11] = 4;
         return msg;
     }
 };
@@ -43,10 +47,9 @@ TEST_F(DiameterServer_test, ListenAndAcceptSinglePeer) {
     server.listen("127.0.0.1", 13868);
 
     std::atomic<bool> peerConnected{false};
-    server.setPeerEventCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Open) peerConnected = true;
-        });
+    server.setPeerEventCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Open) peerConnected = true;
+    });
 
     auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
     clientPeer->connect("127.0.0.1", 13868);
@@ -64,10 +67,9 @@ TEST_F(DiameterServer_test, AcceptMultiplePeers) {
     server.listen("127.0.0.1", 13869);
 
     std::atomic<int> openCount{0};
-    server.setPeerEventCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Open) openCount++;
-        });
+    server.setPeerEventCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Open) openCount++;
+    });
 
     auto client1 = std::make_shared<Peer>(io_, clientConfig());
     auto client2 = std::make_shared<Peer>(io_, clientConfig());
@@ -89,28 +91,24 @@ TEST_F(DiameterServer_test, RequestCallbackDelivery) {
 
     Peer::Buffer receivedMsg;
     std::atomic<bool> received{false};
-    server.setRequestCallback(
-        [&](std::shared_ptr<Peer>, Peer::Buffer&& msg) {
-            receivedMsg = std::move(msg);
-            received = true;
-        });
+    server.setRequestCallback([&](std::shared_ptr<Peer>, Peer::Buffer&& msg) {
+        receivedMsg = std::move(msg);
+        received = true;
+    });
 
     auto client = std::make_shared<Peer>(io_, clientConfig());
-    client->setStateCallback(
-        [&](std::shared_ptr<Peer> p, Peer::State s) {
-            if (s == Peer::State::Open) {
-                p->send(buildAppRequest());
-            }
-        });
+    client->setStateCallback([&](std::shared_ptr<Peer> p, Peer::State s) {
+        if (s == Peer::State::Open) {
+            p->send(buildAppRequest());
+        }
+    });
     client->connect("127.0.0.1", 13870);
 
     runFor(std::chrono::milliseconds(500));
 
     ASSERT_TRUE(received);
     ASSERT_GE(receivedMsg.size(), 20u);
-    uint32_t cmdCode = (uint32_t(receivedMsg[5]) << 16) |
-                       (uint32_t(receivedMsg[6]) << 8) |
-                        uint32_t(receivedMsg[7]);
+    uint32_t cmdCode = (uint32_t(receivedMsg[5]) << 16) | (uint32_t(receivedMsg[6]) << 8) | uint32_t(receivedMsg[7]);
     EXPECT_EQ(cmdCode, 272u);
 
     server.close();
@@ -123,10 +121,9 @@ TEST_F(DiameterServer_test, GracefulShutdown) {
     std::atomic<bool> clientClosed{false};
 
     auto client = std::make_shared<Peer>(io_, clientConfig());
-    client->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Closed) clientClosed = true;
-        });
+    client->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Closed) clientClosed = true;
+    });
     client->connect("127.0.0.1", 13871);
 
     runFor(std::chrono::milliseconds(300));
@@ -155,10 +152,9 @@ TEST_F(DiameterServer_test, StopListeningRejectsNewConnections) {
     // Second client should fail to connect
     std::atomic<bool> client2Closed{false};
     auto client2 = std::make_shared<Peer>(io_, clientConfig());
-    client2->setStateCallback(
-        [&](std::shared_ptr<Peer>, Peer::State s) {
-            if (s == Peer::State::Closed) client2Closed = true;
-        });
+    client2->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Closed) client2Closed = true;
+    });
     client2->connect("127.0.0.1", 13872);
     runFor(std::chrono::milliseconds(500));
 

@@ -35,21 +35,18 @@ Copyright (c) 2024 Eduardo Ramos
 
 #pragma once
 
+#include <boost/asio.hpp>
 #include <cstdint>
+#include <ert/diametercomm/Peer.hpp>
+#include <ert/metrics/Metrics.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include <boost/asio.hpp>
-
-#include <ert/diametercomm/Peer.hpp>
-
-namespace ert
-{
-namespace diametercomm
-{
+namespace ert {
+namespace diametercomm {
 
 /**
  * Diameter server: listens for incoming peer connections.
@@ -65,9 +62,8 @@ namespace diametercomm
  * can send answers back to the correct peer.
  */
 class DiameterServer {
-public:
-
-    using RequestCallback = std::function<void(std::shared_ptr<Peer>, Peer::Buffer&&)>;
+   public:
+    using RequestCallback = std::function<void(std::shared_ptr<Peer>, Peer::Buffer &&)>;
     using PeerEventCallback = std::function<void(std::shared_ptr<Peer>, Peer::State)>;
 
     /**
@@ -75,20 +71,19 @@ public:
      * @param config   Peer configuration (applied to all accepted peers)
      * @param transport TCP or SCTP (default: TCP)
      */
-    DiameterServer(boost::asio::io_context& io, const Peer::Config& config,
-                   Transport transport = Transport::TCP);
+    DiameterServer(boost::asio::io_context &io, const Peer::Config &config, Transport transport = Transport::TCP);
 
     ~DiameterServer();
 
     // Non-copyable
-    DiameterServer(const DiameterServer&) = delete;
-    DiameterServer& operator=(const DiameterServer&) = delete;
+    DiameterServer(const DiameterServer &) = delete;
+    DiameterServer &operator=(const DiameterServer &) = delete;
 
     /**
      * Start listening on the given address and port.
      * Begins accepting connections immediately.
      */
-    void listen(const std::string& bindAddress, uint16_t port);
+    void listen(const std::string &bindAddress, uint16_t port);
 
     /**
      * Stop accepting new connections.
@@ -120,12 +115,35 @@ public:
     void setRequestCallback(RequestCallback cb) { onRequest_ = std::move(cb); }
     void setPeerEventCallback(PeerEventCallback cb) { onPeerEvent_ = std::move(cb); }
 
-private:
+    /**
+     * Send a Diameter answer through the given peer, incrementing metrics.
+     * This is the recommended way to send answers when metrics are enabled.
+     * Falls back to peer->send() if metrics are disabled.
+     *
+     * @param peer   The peer to send the answer through.
+     * @param answer Complete Diameter answer message.
+     * @return true if send succeeded, false otherwise.
+     */
+    bool sendAnswer(std::shared_ptr<Peer> peer, Peer::Buffer answer);
 
+    // --- Metrics ---
+
+    /**
+     * Enable prometheus metrics for the diameter server.
+     * Must be called before listen(). Metrics are optional -- if not enabled,
+     * no overhead is incurred (nullptr checks guard all metric operations).
+     *
+     * @param metrics  Pointer to the ert::metrics::Metrics instance (registry/exposer).
+     * @param source   Label value for the "source" prometheus label. If empty,
+     *                 defaults to "diameter_server".
+     */
+    void enableMetrics(ert::metrics::Metrics *metrics, const std::string &source = "");
+
+   private:
     void doAccept();
     void onPeerStateChange(std::shared_ptr<Peer> peer, Peer::State state);
 
-    boost::asio::io_context& io_;
+    boost::asio::io_context &io_;
     boost::asio::ip::tcp::acceptor acceptor_;
     Peer::Config config_;
     Transport transport_;
@@ -136,7 +154,16 @@ private:
     RequestCallback onRequest_;
     PeerEventCallback onPeerEvent_;
     bool listening_{false};
+
+    // --- Metrics members ---
+    ert::metrics::Metrics *metrics_{};
+    std::string source_{};
+
+    ert::metrics::counter_family_t *requests_received_counter_family_ptr_{};
+    ert::metrics::counter_family_t *answers_sent_counter_family_ptr_{};
+    ert::metrics::counter_family_t *peer_connections_counter_family_ptr_{};
+    ert::metrics::gauge_family_t *active_peers_gauge_family_ptr_{};
 };
 
-} // namespace diametercomm
-} // namespace ert
+}  // namespace diametercomm
+}  // namespace ert

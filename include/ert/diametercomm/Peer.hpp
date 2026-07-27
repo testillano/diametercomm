@@ -40,20 +40,16 @@ Copyright (c) 2024 Eduardo Ramos
 #pragma once
 
 #include <atomic>
+#include <boost/asio.hpp>
 #include <cstdint>
+#include <ert/diametercomm/PeerConnection.hpp>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <boost/asio.hpp>
-
-#include <ert/diametercomm/PeerConnection.hpp>
-
-namespace ert
-{
-namespace diametercomm
-{
+namespace ert {
+namespace diametercomm {
 
 /**
  * Diameter peer state machine.
@@ -74,28 +70,28 @@ namespace diametercomm
  *   DPR/DPA = 282 (Disconnect-Peer)
  */
 class Peer : public std::enable_shared_from_this<Peer> {
-public:
+   public:
     using Buffer = std::vector<uint8_t>;
 
     enum class State {
-        Closed,     // No connection or connection lost
-        WaitCEA,    // Client: CER sent, waiting for CEA
-        WaitCER,    // Server: accepted connection, waiting for CER
-        Open,       // Capability exchange done, ready for traffic
-        Closing     // DPR sent, waiting for DPA
+        Closed,   // No connection or connection lost
+        WaitCEA,  // Client: CER sent, waiting for CEA
+        WaitCER,  // Server: accepted connection, waiting for CER
+        Open,     // Capability exchange done, ready for traffic
+        Closing   // DPR sent, waiting for DPA
     };
 
     /**
      * Configuration for the peer.
      */
     struct Config {
-        std::string originHost;              // Origin-Host for CER/CEA
-        std::string originRealm;             // Origin-Realm for CER/CEA
-        std::string hostIpAddress{"0.0.0.0"};// Host-IP-Address for CER/CEA
-        uint32_t vendorId{0};                // Vendor-Id for CER/CEA
-        std::string productName{"h2diagent"};// Product-Name for CER/CEA
-        uint32_t watchdogIntervalSec{30};    // DWR interval (0 = disabled)
-        uint32_t applicationId{0};           // Supported application
+        std::string originHost;                // Origin-Host for CER/CEA
+        std::string originRealm;               // Origin-Realm for CER/CEA
+        std::string hostIpAddress{"0.0.0.0"};  // Host-IP-Address for CER/CEA
+        uint32_t vendorId{0};                  // Vendor-Id for CER/CEA
+        std::string productName{"h2diagent"};  // Product-Name for CER/CEA
+        uint32_t watchdogIntervalSec{30};      // DWR interval (0 = disabled)
+        std::vector<uint32_t> applicationIds;  // Supported applications (advertised in CER/CEA)
     };
 
     /**
@@ -117,8 +113,7 @@ public:
     /**
      * Create a server-side peer (will wait for CER after accept).
      */
-    Peer(std::shared_ptr<PeerConnection> connection,
-         boost::asio::io_context& io, const Config& config);
+    Peer(std::shared_ptr<PeerConnection> connection, boost::asio::io_context& io, const Config& config);
 
     ~Peer();
 
@@ -167,8 +162,7 @@ public:
     // --- Access underlying socket (for acceptor usage in server mode) ---
     boost::asio::ip::tcp::socket& socket() { return connection_->socket(); }
 
-private:
-
+   private:
     // Message handling
     void onMessage(Buffer&& msg);
     void onError(const boost::system::error_code& ec);
@@ -221,5 +215,5 @@ private:
     StateCallback onState_;
 };
 
-} // namespace diametercomm
-} // namespace ert
+}  // namespace diametercomm
+}  // namespace ert

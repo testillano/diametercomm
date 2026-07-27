@@ -264,9 +264,15 @@ The client will connect, perform CER/CEA, send a request with the given command 
 
 ## Contributing
 
-Please, execute `astyle` formatting (using [frankwolf image](https://hub.docker.com/r/frankwolf/astyle)) before any pull request:
+Please, execute `clang-format` formatting before any pull request:
 
 ```bash
 $ sources=$(find . -name "*.hpp" -o -name "*.cpp")
-$ docker run -i --rm -v $PWD:/data frankwolf/astyle ${sources}
+$ clang-format -i ${sources}
+```
+
+Or using the [Docker image](https://github.com/testillano/clang-format):
+
+```bash
+$ docker run --rm -v $PWD:/data ghcr.io/testillano/clang-format:latest -i ${sources}
 ```

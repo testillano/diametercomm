@@ -32,17 +32,14 @@ Copyright (c) 2024 Eduardo Ramos
 
 #pragma once
 
+#include <boost/asio.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <vector>
 
-#include <boost/asio.hpp>
-
-namespace ert
-{
-namespace diametercomm
-{
+namespace ert {
+namespace diametercomm {
 
 /**
  * Transport protocol for Diameter connections.
@@ -65,7 +62,7 @@ enum class Transport { TCP, SCTP };
  * uses epoll which is protocol-agnostic.
  */
 class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
-public:
+   public:
     using Buffer = std::vector<uint8_t>;
     using MessageCallback = std::function<void(Buffer&&)>;
     using ErrorCallback = std::function<void(const boost::system::error_code&)>;
@@ -73,14 +70,12 @@ public:
     /**
      * Construct from an existing connected socket (server-side: after accept).
      */
-    explicit PeerConnection(boost::asio::ip::tcp::socket socket,
-                            Transport transport = Transport::TCP);
+    explicit PeerConnection(boost::asio::ip::tcp::socket socket, Transport transport = Transport::TCP);
 
     /**
      * Construct with an io_context for client-side connections.
      */
-    explicit PeerConnection(boost::asio::io_context& io,
-                            Transport transport = Transport::TCP);
+    explicit PeerConnection(boost::asio::io_context& io, Transport transport = Transport::TCP);
 
     ~PeerConnection();
 
@@ -93,9 +88,7 @@ public:
     /**
      * Connect to a remote Diameter peer (client-side).
      */
-    void asyncConnect(const std::string& host, uint16_t port,
-                      std::function<void()> onConnected,
-                      ErrorCallback onError);
+    void asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected, ErrorCallback onError);
 
     /**
      * Start reading Diameter messages from the connection.
@@ -132,8 +125,7 @@ public:
      */
     Transport transport() const { return transport_; }
 
-private:
-
+   private:
     void doReadHeader();
     void doReadBody(uint32_t msgLen);
 
@@ -146,5 +138,5 @@ private:
     ErrorCallback onError_;
 };
 
-} // namespace diametercomm
-} // namespace ert
+}  // namespace diametercomm
+}  // namespace ert
