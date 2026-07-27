@@ -12,11 +12,11 @@ class DiameterClient_test : public ::testing::Test {
     boost::asio::io_context io_;
 
     Peer::Config serverConfig() {
-        return {"server.example.com", "example.com", "127.0.0.1", 0, "TestServer", 0, 16777238};
+        return {"server.example.com", "example.com", "127.0.0.1", 0, "TestServer", 0, {16777238}};
     }
 
     Peer::Config clientConfig() {
-        return {"client.example.com", "example.com", "127.0.0.1", 0, "TestClient", 0, 16777238};
+        return {"client.example.com", "example.com", "127.0.0.1", 0, "TestClient", 0, {16777238}};
     }
 
     void runFor(std::chrono::milliseconds timeout) {

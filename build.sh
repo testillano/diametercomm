@@ -45,6 +45,10 @@ usage() {
 
          Other: DBUILD_XTRA_OPTS (extra docker build options)
 
+         Examples:
+           $0 --image
+           DBUILD_XTRA_OPTS=--no-cache $0 --image
+
 EOF
 }
 
