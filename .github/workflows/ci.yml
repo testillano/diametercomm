@@ -33,7 +33,7 @@ jobs:
       name: Check source code format
       run: |
           sources=$(find . -name "*.hpp" -o -name "*.cpp")
-          clang-format --dry-run -Werror ${sources}
+          docker run --rm -v $PWD:/data ghcr.io/testillano/clang-format:latest --dry-run -Werror ${sources}
 
   build_and_push_docker_images_as_local:
     needs: format_style

@@ -143,8 +143,7 @@ TEST_F(DiameterClient_test, SendFailsWhenNotConnected) {
     client.setReconnectEnabled(false);
 
     auto req = buildAppRequest();
-    uint32_t hbh = client.send(
-        std::move(req), [](const Peer::Buffer&) {}, 1000);
+    uint32_t hbh = client.send(std::move(req), [](const Peer::Buffer&) {}, 1000);
     EXPECT_EQ(hbh, 0u);  // send should fail
 }
 
