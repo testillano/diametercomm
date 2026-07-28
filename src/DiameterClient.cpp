@@ -5,6 +5,7 @@ Licensed under the MIT License. Copyright (c) 2024 Eduardo Ramos
 */
 
 #include <ert/diametercomm/DiameterClient.hpp>
+#include <ert/tracing/Logger.hpp>
 
 namespace ert {
 namespace diametercomm {
