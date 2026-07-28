@@ -203,8 +203,8 @@ class Peer : public std::enable_shared_from_this<Peer> {
     Config config_;
     State state_{State::Closed};
 
-    std::atomic<uint32_t> hopByHop_{1};
-    std::atomic<uint32_t> endToEnd_{1};
+    std::atomic<uint32_t> hopByHop_{0};
+    std::atomic<uint32_t> endToEnd_{0};
 
     boost::asio::steady_timer watchdogTimer_;
 

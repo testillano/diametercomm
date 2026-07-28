@@ -20,11 +20,37 @@ Copyright (c) 2024 Eduardo Ramos
 #include <arpa/inet.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <ert/diametercomm/Peer.hpp>
+#include <ert/tracing/Logger.hpp>
+#include <random>
 
 namespace ert {
 namespace diametercomm {
+
+namespace {
+
+// RFC 6733: Hop-by-Hop is a monotonically increasing number whose start value was randomly generated.
+uint32_t generateInitialHopByHop() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist;
+    return dist(gen);
+}
+
+// RFC 6733: End-to-End: high order 12 bits = low 12 bits of current time,
+// low order 20 bits = random value.
+uint32_t generateInitialEndToEnd() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    uint32_t timePart = (static_cast<uint32_t>(std::time(nullptr)) & 0xFFF) << 20;
+    uint32_t randPart = std::uniform_int_distribution<uint32_t>(0, 0xFFFFF)(gen);
+    return timePart | randPart;
+}
+
+}  // anonymous namespace
 
 // Diameter base protocol command codes
 static constexpr uint32_t CMD_CER = 257;
@@ -175,10 +201,16 @@ std::string extractStringAvp(const Buffer& msg, uint32_t avpCode) {
 // ============================================================================
 
 Peer::Peer(boost::asio::io_context& io, const Config& config)
-    : io_(io), connection_(std::make_shared<PeerConnection>(io)), config_(config), watchdogTimer_(io) {}
+    : io_(io), connection_(std::make_shared<PeerConnection>(io)), config_(config), watchdogTimer_(io) {
+    hopByHop_ = generateInitialHopByHop();
+    endToEnd_ = generateInitialEndToEnd();
+}
 
 Peer::Peer(std::shared_ptr<PeerConnection> connection, boost::asio::io_context& io, const Config& config)
-    : io_(io), connection_(std::move(connection)), config_(config), watchdogTimer_(io) {}
+    : io_(io), connection_(std::move(connection)), config_(config), watchdogTimer_(io) {
+    hopByHop_ = generateInitialHopByHop();
+    endToEnd_ = generateInitialEndToEnd();
+}
 
 Peer::~Peer() { stopWatchdog(); }
 
@@ -312,6 +344,11 @@ void Peer::handleCER(const Buffer& msg) {
     remoteOriginHost_ = extractStringAvp(msg, AVP_ORIGIN_HOST);
     remoteOriginRealm_ = extractStringAvp(msg, AVP_ORIGIN_REALM);
 
+    LOGINFORMATIONAL(ert::tracing::Logger::informational(
+        ert::tracing::Logger::asString("CER received from %s (%s), sending CEA", remoteOriginHost_.c_str(),
+                                       remoteOriginRealm_.c_str()),
+        ERT_FILE_LOCATION));
+
     auto cea = buildCEA(msg);
     connection_->asyncWrite(std::move(cea));
 
@@ -328,6 +365,11 @@ void Peer::handleCEA(const Buffer& msg) {
     remoteOriginHost_ = extractStringAvp(msg, AVP_ORIGIN_HOST);
     remoteOriginRealm_ = extractStringAvp(msg, AVP_ORIGIN_REALM);
 
+    LOGINFORMATIONAL(ert::tracing::Logger::informational(
+        ert::tracing::Logger::asString("CEA received from %s (%s), peer Open", remoteOriginHost_.c_str(),
+                                       remoteOriginRealm_.c_str()),
+        ERT_FILE_LOCATION));
+
     setState(State::Open);
     startWatchdog();
 }
@@ -337,6 +379,9 @@ void Peer::handleCEA(const Buffer& msg) {
 // ============================================================================
 void Peer::handleDWR(const Buffer& msg) {
     if (state_ != State::Open) return;
+    LOGINFORMATIONAL(ert::tracing::Logger::informational(
+        ert::tracing::Logger::asString("DWR received from %s, sending DWA", remoteOriginHost_.c_str()),
+        ERT_FILE_LOCATION));
     auto dwa = buildDWA(msg);
     connection_->asyncWrite(std::move(dwa));
 }
@@ -345,7 +390,9 @@ void Peer::handleDWR(const Buffer& msg) {
 // handleDWA (receive DWA - watchdog response, just acknowledge)
 // ============================================================================
 void Peer::handleDWA(const Buffer& /*msg*/) {
-    // Watchdog answered - peer is alive. Nothing else to do.
+    // Watchdog answered - peer is alive.
+    LOGINFORMATIONAL(ert::tracing::Logger::informational(
+        ert::tracing::Logger::asString("DWA received from %s", remoteOriginHost_.c_str()), ERT_FILE_LOCATION));
 }
 
 // ============================================================================
@@ -468,6 +515,8 @@ void Peer::startWatchdog() {
         if (ec) return;  // cancelled
         if (self->state_ != State::Open) return;
 
+        LOGINFORMATIONAL(ert::tracing::Logger::informational(
+            ert::tracing::Logger::asString("Sending DWR to %s", self->remoteOriginHost_.c_str()), ERT_FILE_LOCATION));
         auto dwr = self->buildDWR();
         self->connection_->asyncWrite(std::move(dwr));
         self->startWatchdog();  // reschedule
