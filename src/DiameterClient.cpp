@@ -232,6 +232,10 @@ void DiameterClient::onPeerState(std::shared_ptr<Peer> /*peer*/, Peer::State sta
             gauge.Set(1.0);
         }
     } else if (state == Peer::State::Closed) {
+        LOGWARNING(ert::tracing::Logger::warning(
+            ert::tracing::Logger::asString("Diameter client: connection closed to %s:%d", host_.c_str(), port_),
+            ERT_FILE_LOCATION));
+
         if (metrics_) {
             auto& gauge = peer_state_gauge_family_ptr_->Add({{"source", source_}});
             gauge.Set(0.0);
@@ -287,6 +291,11 @@ void DiameterClient::onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg) {
 // scheduleReconnect
 // ============================================================================
 void DiameterClient::scheduleReconnect() {
+    LOGINFORMATIONAL(ert::tracing::Logger::informational(
+        ert::tracing::Logger::asString("Diameter client: reconnecting to %s:%d in %ld ms", host_.c_str(), port_,
+                                       reconnectCurrent_.count()),
+        ERT_FILE_LOCATION));
+
     reconnectTimer_.expires_after(reconnectCurrent_);
     reconnectTimer_.async_wait([this](const boost::system::error_code& ec) {
         if (ec) return;  // cancelled

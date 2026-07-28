@@ -186,7 +186,7 @@ class DiameterClient {
 
     // Reconnect state
     bool reconnectEnabled_{true};
-    std::chrono::milliseconds reconnectInitial_{1000};
+    std::chrono::milliseconds reconnectInitial_{10000};
     std::chrono::milliseconds reconnectMax_{30000};
     std::chrono::milliseconds reconnectCurrent_{1000};
     boost::asio::steady_timer reconnectTimer_;
