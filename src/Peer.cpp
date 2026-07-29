@@ -354,7 +354,7 @@ void Peer::handleCER(const Buffer& msg) {
     connection_->asyncWrite(std::move(cea));
 
     setState(State::Open);
-    startWatchdog();
+    // Server does not initiate DWR (client does). Server only responds to DWR with DWA.
 }
 
 // ============================================================================
