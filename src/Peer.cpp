@@ -219,7 +219,7 @@ Peer::~Peer() { stopWatchdog(); }
 // ============================================================================
 void Peer::connect(const std::string& host, uint16_t port) {
     auto self = shared_from_this();
-    state_ = State::WaitCEA;  // pre-set so that on failure, setState(Closed) fires callback
+    setState(State::WaitCEA);  // fires callback + ensures Closed transition on failure triggers reconnect
     connection_->asyncConnect(
         host, port,
         [self]() {
