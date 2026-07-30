@@ -109,7 +109,7 @@ void DiameterServer::listen(const std::string& bindAddress, uint16_t port) {
         acceptor_.assign(boost::asio::ip::tcp::v4(), fd);
     } else {
         // TCP: standard boost::asio approach
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(bindAddress), port);
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::make_address(bindAddress), port);
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
         acceptor_.bind(endpoint);
