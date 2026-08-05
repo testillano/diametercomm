@@ -107,8 +107,9 @@ class Peer : public std::enable_shared_from_this<Peer> {
 
     /**
      * Create a client-side peer (will send CER after connect).
+     * @param transport Transport for the outbound connection (default: TCP).
      */
-    Peer(boost::asio::io_context& io, const Config& config);
+    Peer(boost::asio::io_context& io, const Config& config, Transport transport = Transport::TCP);
 
     /**
      * Create a server-side peer (will wait for CER after accept).
@@ -152,8 +153,11 @@ class Peer : public std::enable_shared_from_this<Peer> {
     State state() const { return state_; }
     const std::string& remoteOriginHost() const { return remoteOriginHost_; }
     const std::string& remoteOriginRealm() const { return remoteOriginRealm_; }
+    // Hop-by-Hop: per-connection sequence (this Peer), randomly seeded.
     uint32_t nextHopByHop() { return hopByHop_.fetch_add(1); }
-    uint32_t nextEndToEnd() { return endToEnd_.fetch_add(1); }
+    // End-to-End: node-wide sequence shared by all Peers of this process
+    // (RFC 6733: set once by the originator, unique per node, not per hop).
+    uint32_t nextEndToEnd() { return nodeEndToEnd_.fetch_add(1); }
 
     // --- Callbacks ---
     void setRequestCallback(RequestCallback cb) { onRequest_ = std::move(cb); }
@@ -203,8 +207,10 @@ class Peer : public std::enable_shared_from_this<Peer> {
     Config config_;
     State state_{State::Closed};
 
+    // Hop-by-Hop is per-connection (per Peer); End-to-End is node-wide (shared
+    // across all Peers of this process), per RFC 6733.
     std::atomic<uint32_t> hopByHop_{0};
-    std::atomic<uint32_t> endToEnd_{0};
+    static std::atomic<uint32_t> nodeEndToEnd_;
 
     boost::asio::steady_timer watchdogTimer_;
 

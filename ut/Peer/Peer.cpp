@@ -332,3 +332,42 @@ TEST_F(Peer_test, ForceClose) {
     EXPECT_TRUE(closed);
     EXPECT_EQ(clientPeer->state(), Peer::State::Closed);
 }
+
+// ============================================================================
+// Identifier semantics (RFC 6733):
+//  - Hop-by-Hop is PER-CONNECTION: each Peer has its own randomly-seeded
+//    counter, independent from other Peers.
+//  - End-to-End is NODE-WIDE: a single per-process sequence shared by every
+//    Peer, seeded once at startup and monotonically increasing.
+// ============================================================================
+
+TEST_F(Peer_test, EndToEndIsNodeWideMonotonic) {
+    // Two independent peers (distinct "connections") must draw from the same
+    // node-wide End-to-End sequence, so consecutive draws increase by one
+    // regardless of which peer issued them.
+    Peer a(io_, clientConfig());
+    Peer b(io_, serverConfig());
+
+    uint32_t e1 = a.nextEndToEnd();
+    uint32_t e2 = b.nextEndToEnd();  // different peer, same node sequence
+    uint32_t e3 = a.nextEndToEnd();
+
+    EXPECT_EQ(e2, e1 + 1);
+    EXPECT_EQ(e3, e2 + 1);
+}
+
+TEST_F(Peer_test, HopByHopIsPerConnection) {
+    Peer a(io_, clientConfig());
+    Peer b(io_, clientConfig());
+
+    // Each peer increments its own Hop-by-Hop sequence independently.
+    uint32_t a1 = a.nextHopByHop();
+    uint32_t b1 = b.nextHopByHop();
+    uint32_t a2 = a.nextHopByHop();
+    uint32_t b2 = b.nextHopByHop();
+
+    EXPECT_EQ(a2, a1 + 1);  // a advances on its own counter
+    EXPECT_EQ(b2, b1 + 1);  // b advances on its own counter
+    // Interleaving a and b did not perturb each other's sequence: this only
+    // holds if the counters are per-Peer (not shared like End-to-End).
+}

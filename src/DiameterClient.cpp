@@ -65,8 +65,8 @@ uint32_t extractResultCode(const Peer::Buffer& msg) {
 // Construction
 // ============================================================================
 
-DiameterClient::DiameterClient(boost::asio::io_context& io, const Peer::Config& config)
-    : io_(io), config_(config), reconnectTimer_(io) {}
+DiameterClient::DiameterClient(boost::asio::io_context& io, const Peer::Config& config, Transport transport)
+    : io_(io), config_(config), transport_(transport), reconnectTimer_(io) {}
 
 DiameterClient::~DiameterClient() {
     reconnectEnabled_ = false;
@@ -106,7 +106,7 @@ void DiameterClient::connect(const std::string& host, uint16_t port) {
     port_ = port;
     reconnectCurrent_ = reconnectInitial_;
 
-    peer_ = std::make_shared<Peer>(io_, config_);
+    peer_ = std::make_shared<Peer>(io_, config_, transport_);
 
     peer_->setStateCallback([this](std::shared_ptr<Peer> p, Peer::State s) { onPeerState(std::move(p), s); });
 

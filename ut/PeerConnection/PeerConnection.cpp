@@ -1,4 +1,8 @@
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -6,6 +10,44 @@
 #include <vector>
 
 using namespace ert::diametercomm;
+
+// SCTP may be unavailable in some CI/container kernels; skip SCTP tests there.
+static bool sctpAvailable() {
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
+
+// Build a native SCTP (one-to-one) listening socket bound to 127.0.0.1:0 and
+// assign it to a boost::asio acceptor. Returns the ephemeral port via out-param.
+// Mirrors DiameterServer::listen()'s SCTP path.
+static bool makeSctpAcceptor(boost::asio::ip::tcp::acceptor& acceptor, uint16_t& port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
+    if (fd < 0) return false;
+    int reuse = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;  // ephemeral
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+    if (::listen(fd, 16) < 0) {
+        ::close(fd);
+        return false;
+    }
+    boost::system::error_code ec;
+    acceptor.assign(boost::asio::ip::tcp::v4(), fd, ec);
+    if (ec) {
+        ::close(fd);
+        return false;
+    }
+    port = acceptor.local_endpoint().port();
+    return true;
+}
 
 // Helper: build a minimal valid Diameter message buffer (20 bytes)
 static PeerConnection::Buffer buildMinimalMessage(uint32_t hbh = 0x12345678) {
@@ -278,4 +320,49 @@ TEST_F(PeerConnection_test, InvalidMessageLengthTriggersError) {
 
     runFor(std::chrono::milliseconds(500));
     EXPECT_TRUE(errorReceived);
+}
+
+// =============================================================================
+// SCTP single-homing client connect path. Directly exercises the SCTP branch of
+// asyncConnect (IPPROTO_SCTP socket, native fd assigned to the asio socket via
+// the resolved-family protocol) and the v4/v6 assign fix, end to end over a
+// native SCTP listener.
+// =============================================================================
+TEST_F(PeerConnection_test, SctpClientConnectAndRoundTrip) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    boost::asio::ip::tcp::acceptor sctpAcceptor(io_);
+    uint16_t sctpPort = 0;
+    ASSERT_TRUE(makeSctpAcceptor(sctpAcceptor, sctpPort));
+
+    auto expectedMsg = buildMinimalMessage(0x0A0B0C0D);
+    PeerConnection::Buffer received;
+    std::atomic<bool> messageReceived{false};
+
+    auto serverSock = std::make_shared<boost::asio::ip::tcp::socket>(io_);
+    std::shared_ptr<PeerConnection> serverConn;
+    sctpAcceptor.async_accept(*serverSock, [&](const boost::system::error_code& ec) {
+        ASSERT_FALSE(ec) << ec.message();
+        serverConn = std::make_shared<PeerConnection>(std::move(*serverSock), Transport::SCTP);
+        serverConn->startReading(
+            [&](PeerConnection::Buffer&& msg) {
+                received = std::move(msg);
+                messageReceived = true;
+            },
+            [](const boost::system::error_code&) {});
+    });
+
+    auto clientConn = std::make_shared<PeerConnection>(io_, Transport::SCTP);
+    clientConn->asyncConnect(
+        "127.0.0.1", sctpPort, [&]() { clientConn->asyncWrite(expectedMsg); },
+        [](const boost::system::error_code& ec) { FAIL() << ec.message(); });
+
+    runFor(std::chrono::milliseconds(500));
+    ASSERT_TRUE(messageReceived);
+    EXPECT_EQ(received, expectedMsg);
+
+    clientConn->close();
+    if (serverConn) serverConn->close();
+    boost::system::error_code ec;
+    sctpAcceptor.close(ec);
 }

@@ -83,10 +83,12 @@ class DiameterClient {
     using StateCallback = std::function<void(Peer::State)>;
 
     /**
-     * @param io       io_context for async operations
-     * @param config   Peer configuration
+     * @param io        io_context for async operations
+     * @param config    Peer configuration
+     * @param transport Transport for the outbound connection (default: TCP).
+     *                  SCTP yields single-homing (one source, one peer address).
      */
-    DiameterClient(boost::asio::io_context& io, const Peer::Config& config);
+    DiameterClient(boost::asio::io_context& io, const Peer::Config& config, Transport transport = Transport::TCP);
 
     ~DiameterClient();
 
@@ -175,6 +177,7 @@ class DiameterClient {
 
     boost::asio::io_context& io_;
     Peer::Config config_;
+    Transport transport_;
     std::shared_ptr<Peer> peer_;
 
     std::string host_;

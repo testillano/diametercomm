@@ -52,6 +52,7 @@ void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::f
                     return;
                 }
                 int family = it->endpoint().address().is_v6() ? AF_INET6 : AF_INET;
+                bool isV6 = (family == AF_INET6);
                 int fd = ::socket(family, SOCK_STREAM, IPPROTO_SCTP);
                 if (fd < 0) {
                     if (onError)
@@ -59,14 +60,32 @@ void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::f
                     return;
                 }
                 boost::system::error_code assign_ec;
-                self->socket_.assign(boost::asio::ip::tcp::v4(), fd, assign_ec);
+                auto proto = isV6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4();
+                self->socket_.assign(proto, fd, assign_ec);
                 if (assign_ec) {
                     ::close(fd);
                     if (onError) onError(assign_ec);
                     return;
                 }
+
+                // Single-homing: connect the assigned SCTP socket to the single
+                // resolved endpoint via the member async_connect. We must NOT use
+                // the range free-function async_connect here: it closes/reopens
+                // the socket for each candidate endpoint (reopening as TCP via
+                // endpoint.protocol()), which would silently discard our SCTP fd.
+                boost::asio::ip::tcp::endpoint endpoint = it->endpoint();
+                self->socket_.async_connect(endpoint,
+                                            [self, onConnected, onError](const boost::system::error_code& ec2) {
+                                                if (ec2) {
+                                                    if (onError) onError(ec2);
+                                                    return;
+                                                }
+                                                if (onConnected) onConnected();
+                                            });
+                return;
             }
 
+            // TCP: standard range connect (tries each resolved endpoint in turn).
             boost::asio::async_connect(self->socket_, results,
                                        [self, onConnected, onError](const boost::system::error_code& ec2,
                                                                     const boost::asio::ip::tcp::endpoint&) {
@@ -75,9 +94,7 @@ void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::f
                                                return;
                                            }
                                            // Disable Nagle for TCP
-                                           if (self->transport_ == Transport::TCP) {
-                                               self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
-                                           }
+                                           self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
                                            if (onConnected) onConnected();
                                        });
         });

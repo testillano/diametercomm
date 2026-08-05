@@ -1,4 +1,7 @@
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -6,6 +9,14 @@
 #include <ert/diametercomm/DiameterServer.hpp>
 
 using namespace ert::diametercomm;
+
+// SCTP may be unavailable in some CI/container kernels; skip SCTP tests there.
+static bool sctpAvailable() {
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
 
 class DiameterClient_test : public ::testing::Test {
    protected:
@@ -267,4 +278,140 @@ TEST_F(DiameterClient_test, UnsolicitedRequestFromServer) {
 
     client.close();
     server.close();
+}
+
+// =============================================================================
+// SCTP single-homing (client transport). Exercises the DiameterClient ->
+// Peer -> PeerConnection SCTP plumbing (G1) against an SCTP DiameterServer.
+// =============================================================================
+
+TEST_F(DiameterClient_test, ConnectAndBecomeReady_SCTP) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    DiameterServer server(io_, serverConfig(), Transport::SCTP);
+    server.listen("127.0.0.1", 14880);
+
+    DiameterClient client(io_, clientConfig(), Transport::SCTP);
+    client.setReconnectEnabled(false);
+
+    std::atomic<bool> ready{false};
+    client.setStateCallback([&](Peer::State s) {
+        if (s == Peer::State::Open) ready = true;
+    });
+
+    client.connect("127.0.0.1", 14880);
+    runFor(std::chrono::milliseconds(500));
+
+    EXPECT_TRUE(ready);
+    EXPECT_TRUE(client.isReady());
+    EXPECT_EQ(client.state(), Peer::State::Open);
+
+    client.close();
+    server.close();
+}
+
+TEST_F(DiameterClient_test, SendRequestAndReceiveCorrelatedResponse_SCTP) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    DiameterServer server(io_, serverConfig(), Transport::SCTP);
+    server.listen("127.0.0.1", 14881);
+
+    // Server echoes back an answer for every request
+    server.setRequestCallback([&](std::shared_ptr<Peer> peer, Peer::Buffer&& msg) {
+        uint32_t hbh = extractHopByHop(msg);
+        peer->send(buildAppAnswer(hbh));
+    });
+
+    DiameterClient client(io_, clientConfig(), Transport::SCTP);
+    client.setReconnectEnabled(false);
+
+    Peer::Buffer responseReceived;
+    std::atomic<bool> gotResponse{false};
+
+    client.setStateCallback([&](Peer::State s) {
+        if (s == Peer::State::Open) {
+            client.send(
+                buildAppRequest(),
+                [&](const Peer::Buffer& resp) {
+                    responseReceived = resp;
+                    gotResponse = true;
+                },
+                5000);
+        }
+    });
+
+    client.connect("127.0.0.1", 14881);
+    runFor(std::chrono::milliseconds(500));
+
+    ASSERT_TRUE(gotResponse);
+    ASSERT_GE(responseReceived.size(), 20u);
+    EXPECT_EQ(responseReceived[4] & 0x80, 0);  // answer (R-bit clear)
+
+    client.close();
+    server.close();
+}
+
+// Backwards-compat guard: default transport must remain TCP, so an SCTP server
+// and a default (TCP) client must NOT establish an Open association.
+TEST_F(DiameterClient_test, DefaultTransportIsTcp_NoMixedAssociation) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    DiameterServer server(io_, serverConfig(), Transport::SCTP);
+    server.listen("127.0.0.1", 14882);
+
+    DiameterClient client(io_, clientConfig());  // no transport arg -> TCP
+    client.setReconnectEnabled(false);
+
+    std::atomic<bool> ready{false};
+    client.setStateCallback([&](Peer::State s) {
+        if (s == Peer::State::Open) ready = true;
+    });
+
+    client.connect("127.0.0.1", 14882);
+    runFor(std::chrono::milliseconds(400));
+
+    EXPECT_FALSE(ready);
+    EXPECT_FALSE(client.isReady());
+
+    client.close();
+    server.close();
+}
+
+// Reconnect must reuse the configured SCTP transport: after losing the SCTP
+// association, the client re-establishes a brand-new SCTP association (INIT/
+// COOKIE + CER/CEA) against a server relistening on the same port. Mirrors the
+// TCP ReconnectOnConnectionLoss test.
+TEST_F(DiameterClient_test, ReconnectOnConnectionLoss_SCTP) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    DiameterServer server(io_, serverConfig(), Transport::SCTP);
+    server.listen("127.0.0.1", 14883);
+
+    DiameterClient client(io_, clientConfig(), Transport::SCTP);
+    client.setReconnectEnabled(true);
+    client.setReconnectBackoff(std::chrono::milliseconds(100), std::chrono::milliseconds(500));
+
+    std::atomic<int> openCount{0};
+    client.setStateCallback([&](Peer::State s) {
+        if (s == Peer::State::Open) openCount++;
+    });
+
+    client.connect("127.0.0.1", 14883);
+    runFor(std::chrono::milliseconds(300));
+    EXPECT_EQ(openCount.load(), 1);
+
+    // Force server to close the association
+    server.close();
+    runFor(std::chrono::milliseconds(100));
+
+    // Restart an SCTP server on the same port
+    DiameterServer server2(io_, serverConfig(), Transport::SCTP);
+    server2.listen("127.0.0.1", 14883);
+
+    // Wait for reconnect (100ms backoff + SCTP handshake + CER/CEA)
+    runFor(std::chrono::milliseconds(600));
+    EXPECT_GE(openCount.load(), 2);
+
+    client.close();
+    server2.close();
 }

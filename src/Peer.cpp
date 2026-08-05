@@ -200,16 +200,19 @@ std::string extractStringAvp(const Buffer& msg, uint32_t avpCode) {
 // Construction
 // ============================================================================
 
-Peer::Peer(boost::asio::io_context& io, const Config& config)
-    : io_(io), connection_(std::make_shared<PeerConnection>(io)), config_(config), watchdogTimer_(io) {
+// RFC 6733: the End-to-End Identifier is node-wide. Seed it ONCE per process
+// (time + random) and increment it monotonically across every Peer/connection.
+// The Hop-by-Hop Identifier, in contrast, is seeded per Peer (per connection).
+std::atomic<uint32_t> Peer::nodeEndToEnd_{generateInitialEndToEnd()};
+
+Peer::Peer(boost::asio::io_context& io, const Config& config, Transport transport)
+    : io_(io), connection_(std::make_shared<PeerConnection>(io, transport)), config_(config), watchdogTimer_(io) {
     hopByHop_ = generateInitialHopByHop();
-    endToEnd_ = generateInitialEndToEnd();
 }
 
 Peer::Peer(std::shared_ptr<PeerConnection> connection, boost::asio::io_context& io, const Config& config)
     : io_(io), connection_(std::move(connection)), config_(config), watchdogTimer_(io) {
     hopByHop_ = generateInitialHopByHop();
-    endToEnd_ = generateInitialEndToEnd();
 }
 
 Peer::~Peer() { stopWatchdog(); }

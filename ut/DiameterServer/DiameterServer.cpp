@@ -1,10 +1,21 @@
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <ert/diametercomm/DiameterServer.hpp>
 
 using namespace ert::diametercomm;
+
+// SCTP may be unavailable in some CI/container kernels; skip SCTP tests there.
+static bool sctpAvailable() {
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
 
 class DiameterServer_test : public ::testing::Test {
    protected:
@@ -180,5 +191,32 @@ TEST_F(DiameterServer_test, PeerDisconnectRemovesFromList) {
     EXPECT_EQ(server.activePeerCount(), 0u);
     EXPECT_EQ(server.peers().size(), 0u);
 
+    server.close();
+}
+
+// =============================================================================
+// SCTP single-homing server (G2). Exercises DiameterServer's SCTP listen path
+// plus the Peer SCTP client ctor over a real SCTP association.
+// =============================================================================
+TEST_F(DiameterServer_test, ListenAndAcceptSinglePeer_SCTP) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    DiameterServer server(io_, serverConfig(), Transport::SCTP);
+    server.listen("127.0.0.1", 13880);
+
+    std::atomic<bool> peerConnected{false};
+    server.setPeerEventCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+        if (s == Peer::State::Open) peerConnected = true;
+    });
+
+    auto clientPeer = std::make_shared<Peer>(io_, clientConfig(), Transport::SCTP);
+    clientPeer->connect("127.0.0.1", 13880);
+
+    runFor(std::chrono::milliseconds(500));
+
+    EXPECT_TRUE(peerConnected);
+    EXPECT_EQ(server.activePeerCount(), 1u);
+
+    clientPeer->close();
     server.close();
 }

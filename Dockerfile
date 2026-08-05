@@ -34,7 +34,7 @@ ARG pboettch_jsonschemavalidator_ver=2.4.0
 ARG jupp0r_prometheuscpp_ver=v1.3.0
 ARG civetweb_civetweb_ver=v1.16
 ARG ert_metrics_ver=v1.3.0
-ARG ert_diametercodec_ver=v1.0.0
+ARG ert_diametercodec_ver=v1.1.0
 ARG google_test_ver=v1.11.0
 
 # ---------------------------------------------------------------------------
