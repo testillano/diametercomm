@@ -147,6 +147,7 @@ class DiameterServer {
     boost::asio::ip::tcp::acceptor acceptor_;
     Peer::Config config_;
     Transport transport_;
+    std::shared_ptr<boost::asio::ssl::context> serverCtx_;  // prebuilt TLS/TCP server context (null if insecure)
 
     mutable std::mutex peersMutex_;
     std::vector<std::shared_ptr<Peer>> peers_;

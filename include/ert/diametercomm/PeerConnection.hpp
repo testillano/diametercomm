@@ -33,9 +33,11 @@ Copyright (c) 2024 Eduardo Ramos
 #pragma once
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ert {
@@ -48,6 +50,33 @@ namespace diametercomm {
  * because we assign the SCTP fd to a tcp::socket (both are SOCK_STREAM).
  */
 enum class Transport { TCP, SCTP };
+
+/**
+ * TLS configuration for a Diameter connection (TCP transport only).
+ *
+ * Secures Diameter over TCP with TLS per RFC 6733. Diameter over SCTP would use
+ * DTLS/SCTP (RFC 6083), which is NOT implemented here (see the h2diagent README
+ * "gap" note): enabling TLS on an SCTP transport is a no-op by design.
+ *
+ * Server role: @c certFile + @c keyFile (+ optional @c keyPassword) enable TLS;
+ * the server presents its certificate (server-auth). Client-certificate
+ * verification (mTLS) happens only when @c verifyPeer is set together with a
+ * @c caFile.
+ *
+ * Client role: @c enabled toggles TLS on the outbound connection. The server
+ * certificate is verified only when @c verifyPeer is set together with a
+ * @c caFile (otherwise the handshake still encrypts the channel but does not
+ * authenticate the peer). @c certFile / @c keyFile are optional (client
+ * certificate for mTLS).
+ */
+struct TlsConfig {
+    bool enabled{false};      // master switch for this connection role
+    std::string certFile;     // PEM certificate (chain)
+    std::string keyFile;      // PEM private key
+    std::string keyPassword;  // private key password (optional)
+    std::string caFile;       // trusted CA to verify the peer (optional)
+    bool verifyPeer{false};   // verify the peer certificate against caFile
+};
 
 /**
  * TCP/SCTP connection with Diameter message framing.
@@ -125,6 +154,30 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
      */
     Transport transport() const { return transport_; }
 
+    /**
+     * Wrap this connection in a TLS stream using the given SSL context.
+     * @param ctx     Prebuilt SSL context (see makeServerContext/makeClientContext).
+     * @param server  true for server-side handshake, false for client-side.
+     * Only meaningful for TCP; callers must not enable it for SCTP.
+     */
+    void enableTls(std::shared_ptr<boost::asio::ssl::context> ctx, bool server);
+
+    /**
+     * Perform the server-side TLS handshake (after accept). Must be called
+     * before startReading() on a TLS server connection. If TLS was not enabled
+     * it simply invokes onDone (plain connection).
+     */
+    void asyncHandshakeServer(std::function<void()> onDone, ErrorCallback onError);
+
+    /** Whether TLS has been enabled on this connection. */
+    bool tlsEnabled() const { return tls_; }
+
+    /** Build a server-side SSL context from the given TLS configuration. */
+    static std::shared_ptr<boost::asio::ssl::context> makeServerContext(const TlsConfig& tls);
+
+    /** Build a client-side SSL context from the given TLS configuration. */
+    static std::shared_ptr<boost::asio::ssl::context> makeClientContext(const TlsConfig& tls);
+
    private:
     void doReadHeader();
     void doReadBody(uint32_t msgLen);
@@ -136,6 +189,12 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
 
     MessageCallback onMessage_;
     ErrorCallback onError_;
+
+    // --- TLS (TCP only) ---
+    bool tls_{false};
+    bool tlsServer_{false};
+    std::shared_ptr<boost::asio::ssl::context> sslContext_;
+    std::unique_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>> sslStream_;
 };
 
 }  // namespace diametercomm

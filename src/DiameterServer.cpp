@@ -56,7 +56,13 @@ uint32_t extractResultCode(const Peer::Buffer& msg) {
 }  // anonymous namespace
 
 DiameterServer::DiameterServer(boost::asio::io_context& io, const Peer::Config& config, Transport transport)
-    : io_(io), acceptor_(io), config_(config), transport_(transport) {}
+    : io_(io), acceptor_(io), config_(config), transport_(transport) {
+    // Build the TLS/TCP server context once (reused for every accepted peer).
+    // TLS is not applied to SCTP (DTLS/SCTP is out of scope -- see README gap).
+    if (config_.tls.enabled && transport_ == Transport::TCP) {
+        serverCtx_ = PeerConnection::makeServerContext(config_.tls);
+    }
+}
 
 DiameterServer::~DiameterServer() { close(); }
 
@@ -202,28 +208,40 @@ void DiameterServer::doAccept() {
         // Create PeerConnection from accepted socket
         auto connection = std::make_shared<PeerConnection>(std::move(*acceptedSocket), transport_);
 
-        // Create a new Peer in server mode
-        auto peer = std::make_shared<Peer>(connection, io_, config_);
+        // Create + start the server-side Peer on a (possibly TLS-handshaked) connection.
+        auto startPeer = [this](std::shared_ptr<PeerConnection> conn) {
+            auto peer = std::make_shared<Peer>(conn, io_, config_);
 
-        peer->setRequestCallback([this](std::shared_ptr<Peer> p, Peer::Buffer&& msg) {
-            if (metrics_) {
-                std::string commandCode = std::to_string(extractCommandCode(msg));
-                auto& counter =
-                    requests_received_counter_family_ptr_->Add({{"source", source_}, {"command_code", commandCode}});
-                counter.Increment();
+            peer->setRequestCallback([this](std::shared_ptr<Peer> p, Peer::Buffer&& msg) {
+                if (metrics_) {
+                    std::string commandCode = std::to_string(extractCommandCode(msg));
+                    auto& counter = requests_received_counter_family_ptr_->Add(
+                        {{"source", source_}, {"command_code", commandCode}});
+                    counter.Increment();
+                }
+                if (onRequest_) onRequest_(std::move(p), std::move(msg));
+            });
+
+            peer->setStateCallback(
+                [this](std::shared_ptr<Peer> p, Peer::State state) { onPeerStateChange(std::move(p), state); });
+
+            {
+                std::lock_guard<std::mutex> lock(peersMutex_);
+                peers_.push_back(peer);
             }
-            if (onRequest_) onRequest_(std::move(p), std::move(msg));
-        });
 
-        peer->setStateCallback(
-            [this](std::shared_ptr<Peer> p, Peer::State state) { onPeerStateChange(std::move(p), state); });
+            peer->start();
+        };
 
-        {
-            std::lock_guard<std::mutex> lock(peersMutex_);
-            peers_.push_back(peer);
+        if (serverCtx_) {
+            // TLS/TCP: handshake first; only create/start the Peer on success.
+            connection->enableTls(serverCtx_, /*server*/ true);
+            connection->asyncHandshakeServer([startPeer, connection]() { startPeer(connection); },
+                                             [](const boost::system::error_code&) { /* drop on handshake failure */ });
+        } else {
+            startPeer(connection);
         }
 
-        peer->start();
         doAccept();
     });
 }

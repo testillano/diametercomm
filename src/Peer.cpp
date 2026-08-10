@@ -223,6 +223,13 @@ Peer::~Peer() { stopWatchdog(); }
 void Peer::connect(const std::string& host, uint16_t port) {
     auto self = shared_from_this();
     setState(State::WaitCEA);  // fires callback + ensures Closed transition on failure triggers reconnect
+
+    // TLS/TCP: wrap the client connection before connecting (handshake runs
+    // inside asyncConnect, after TCP connect). TLS is not applied to SCTP.
+    if (config_.tls.enabled && connection_->transport() == Transport::TCP) {
+        connection_->enableTls(PeerConnection::makeClientContext(config_.tls), /*server*/ false);
+    }
+
     connection_->asyncConnect(
         host, port,
         [self]() {

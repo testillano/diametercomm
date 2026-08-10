@@ -16,6 +16,8 @@ PUBLIC
     Boost::system
     Threads::Threads
     ert_metrics
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 install(TARGETS ${ERT_DIAMETERCOMM_TARGET_NAME}

@@ -61,6 +61,7 @@ endif()
 ################
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)  # Boost.Asio TLS (ssl::stream) for secure Diameter over TCP
 
 # ert_metrics (prometheus-cpp based metrics library)
 find_library(ERT_METRICS_LIBRARY ert_metrics PATHS ${CMAKE_PREFIX_PATH}/lib/ert)

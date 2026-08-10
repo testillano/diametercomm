@@ -92,6 +92,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
         std::string productName{"h2diagent"};  // Product-Name for CER/CEA
         uint32_t watchdogIntervalSec{30};      // DWR interval (0 = disabled)
         std::vector<uint32_t> applicationIds;  // Supported applications (advertised in CER/CEA)
+        TlsConfig tls;                         // TLS/TCP security (disabled by default; TCP only)
     };
 
     /**

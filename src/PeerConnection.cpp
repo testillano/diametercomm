@@ -28,6 +28,74 @@ PeerConnection::PeerConnection(boost::asio::io_context& io, Transport transport)
 PeerConnection::~PeerConnection() { close(); }
 
 // ============================================================================
+// TLS (TCP only): context factories, enable and server-side handshake
+// ============================================================================
+std::shared_ptr<boost::asio::ssl::context> PeerConnection::makeServerContext(const TlsConfig& tls) {
+    auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+    ctx->set_options(boost::asio::ssl::context::default_workarounds | boost::asio::ssl::context::no_sslv2 |
+                     boost::asio::ssl::context::no_sslv3 | boost::asio::ssl::context::single_dh_use);
+    if (!tls.keyPassword.empty()) {
+        std::string pw = tls.keyPassword;
+        ctx->set_password_callback([pw](std::size_t, boost::asio::ssl::context::password_purpose) { return pw; });
+    }
+    ctx->use_certificate_chain_file(tls.certFile);
+    ctx->use_private_key_file(tls.keyFile, boost::asio::ssl::context::pem);
+    if (tls.verifyPeer && !tls.caFile.empty()) {
+        ctx->load_verify_file(tls.caFile);
+        ctx->set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert);
+    } else {
+        ctx->set_verify_mode(boost::asio::ssl::verify_none);
+    }
+    return ctx;
+}
+
+std::shared_ptr<boost::asio::ssl::context> PeerConnection::makeClientContext(const TlsConfig& tls) {
+    auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_client);
+    ctx->set_options(boost::asio::ssl::context::default_workarounds | boost::asio::ssl::context::no_sslv2 |
+                     boost::asio::ssl::context::no_sslv3);
+    if (tls.verifyPeer && !tls.caFile.empty()) {
+        ctx->load_verify_file(tls.caFile);
+        ctx->set_verify_mode(boost::asio::ssl::verify_peer);
+    } else {
+        ctx->set_verify_mode(boost::asio::ssl::verify_none);
+    }
+    // Optional client certificate (mTLS)
+    if (!tls.certFile.empty() && !tls.keyFile.empty()) {
+        if (!tls.keyPassword.empty()) {
+            std::string pw = tls.keyPassword;
+            ctx->set_password_callback([pw](std::size_t, boost::asio::ssl::context::password_purpose) { return pw; });
+        }
+        ctx->use_certificate_chain_file(tls.certFile);
+        ctx->use_private_key_file(tls.keyFile, boost::asio::ssl::context::pem);
+    }
+    return ctx;
+}
+
+void PeerConnection::enableTls(std::shared_ptr<boost::asio::ssl::context> ctx, bool server) {
+    if (!ctx) return;
+    sslContext_ = std::move(ctx);
+    tlsServer_ = server;
+    tls_ = true;
+    sslStream_ = std::make_unique<boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>>(socket_, *sslContext_);
+}
+
+void PeerConnection::asyncHandshakeServer(std::function<void()> onDone, ErrorCallback onError) {
+    if (!tls_) {
+        if (onDone) onDone();
+        return;
+    }
+    auto self = shared_from_this();
+    sslStream_->async_handshake(boost::asio::ssl::stream_base::server,
+                                [self, onDone, onError](const boost::system::error_code& ec) {
+                                    if (ec) {
+                                        if (onError) onError(ec);
+                                        return;
+                                    }
+                                    if (onDone) onDone();
+                                });
+}
+
+// ============================================================================
 // asyncConnect (client-side)
 // ============================================================================
 void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected,
@@ -95,7 +163,20 @@ void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::f
                                            }
                                            // Disable Nagle for TCP
                                            self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
-                                           if (onConnected) onConnected();
+                                           if (self->tls_) {
+                                               // TLS/TCP: perform client handshake before signalling connected.
+                                               self->sslStream_->async_handshake(
+                                                   boost::asio::ssl::stream_base::client,
+                                                   [self, onConnected, onError](const boost::system::error_code& hec) {
+                                                       if (hec) {
+                                                           if (onError) onError(hec);
+                                                           return;
+                                                       }
+                                                       if (onConnected) onConnected();
+                                                   });
+                                           } else {
+                                               if (onConnected) onConnected();
+                                           }
                                        });
         });
 }
@@ -114,24 +195,28 @@ void PeerConnection::startReading(MessageCallback onMessage, ErrorCallback onErr
 // ============================================================================
 void PeerConnection::doReadHeader() {
     auto self = shared_from_this();
-    boost::asio::async_read(socket_, boost::asio::buffer(headerBuf_),
-                            [self](const boost::system::error_code& ec, std::size_t) {
-                                if (ec) {
-                                    if (self->onError_) self->onError_(ec);
-                                    return;
-                                }
+    auto handler = [self](const boost::system::error_code& ec, std::size_t) {
+        if (ec) {
+            if (self->onError_) self->onError_(ec);
+            return;
+        }
 
-                                uint32_t msgLen = (uint32_t(self->headerBuf_[1]) << 16) |
-                                                  (uint32_t(self->headerBuf_[2]) << 8) | uint32_t(self->headerBuf_[3]);
+        uint32_t msgLen = (uint32_t(self->headerBuf_[1]) << 16) | (uint32_t(self->headerBuf_[2]) << 8) |
+                          uint32_t(self->headerBuf_[3]);
 
-                                if (msgLen < 20 || msgLen > 16777215) {
-                                    auto err = boost::system::errc::make_error_code(boost::system::errc::message_size);
-                                    if (self->onError_) self->onError_(err);
-                                    return;
-                                }
+        if (msgLen < 20 || msgLen > 16777215) {
+            auto err = boost::system::errc::make_error_code(boost::system::errc::message_size);
+            if (self->onError_) self->onError_(err);
+            return;
+        }
 
-                                self->doReadBody(msgLen);
-                            });
+        self->doReadBody(msgLen);
+    };
+    if (tls_) {
+        boost::asio::async_read(*sslStream_, boost::asio::buffer(headerBuf_), std::move(handler));
+    } else {
+        boost::asio::async_read(socket_, boost::asio::buffer(headerBuf_), std::move(handler));
+    }
 }
 
 // ============================================================================
@@ -149,19 +234,23 @@ void PeerConnection::doReadBody(uint32_t msgLen) {
     }
 
     auto self = shared_from_this();
-    boost::asio::async_read(socket_, boost::asio::buffer(readBuf_.data() + 4, remaining),
-                            [self](const boost::system::error_code& ec, std::size_t) {
-                                if (ec) {
-                                    if (self->onError_) self->onError_(ec);
-                                    return;
-                                }
+    auto handler = [self](const boost::system::error_code& ec, std::size_t) {
+        if (ec) {
+            if (self->onError_) self->onError_(ec);
+            return;
+        }
 
-                                if (self->onMessage_) {
-                                    self->onMessage_(std::move(self->readBuf_));
-                                }
+        if (self->onMessage_) {
+            self->onMessage_(std::move(self->readBuf_));
+        }
 
-                                self->doReadHeader();
-                            });
+        self->doReadHeader();
+    };
+    if (tls_) {
+        boost::asio::async_read(*sslStream_, boost::asio::buffer(readBuf_.data() + 4, remaining), std::move(handler));
+    } else {
+        boost::asio::async_read(socket_, boost::asio::buffer(readBuf_.data() + 4, remaining), std::move(handler));
+    }
 }
 
 // ============================================================================
@@ -171,14 +260,18 @@ void PeerConnection::asyncWrite(Buffer msg, std::function<void()> onComplete) {
     auto self = shared_from_this();
     auto msgPtr = std::make_shared<Buffer>(std::move(msg));
 
-    boost::asio::async_write(socket_, boost::asio::buffer(*msgPtr),
-                             [self, msgPtr, onComplete](const boost::system::error_code& ec, std::size_t) {
-                                 if (ec) {
-                                     if (self->onError_) self->onError_(ec);
-                                     return;
-                                 }
-                                 if (onComplete) onComplete();
-                             });
+    auto handler = [self, msgPtr, onComplete](const boost::system::error_code& ec, std::size_t) {
+        if (ec) {
+            if (self->onError_) self->onError_(ec);
+            return;
+        }
+        if (onComplete) onComplete();
+    };
+    if (tls_) {
+        boost::asio::async_write(*sslStream_, boost::asio::buffer(*msgPtr), std::move(handler));
+    } else {
+        boost::asio::async_write(socket_, boost::asio::buffer(*msgPtr), std::move(handler));
+    }
 }
 
 // ============================================================================
