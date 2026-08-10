@@ -114,7 +114,8 @@ class DiameterClient {
      * @param timeoutMs  Timeout in milliseconds (0 = no timeout)
      * @return hop-by-hop ID used, or 0 if send failed (not connected)
      */
-    uint32_t send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs = 5000);
+    uint32_t send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs = 5000,
+                  const ert::metrics::labels_t& additionalLabels = {});
 
     /**
      * Graceful disconnect (DPR/DPA).
@@ -169,9 +170,17 @@ class DiameterClient {
     void onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg);
     void scheduleReconnect();
 
+    // Build the metric label set: base {source, command_code, application_id}
+    // plus result_code (answers only) and any configured additional labels.
+    ert::metrics::labels_t clientLabels(const std::string& commandCode, const std::string& applicationId,
+                                        const ert::metrics::labels_t& additionalLabels,
+                                        const std::string& resultCode = "") const;
+
     struct PendingRequest {
         ResponseCallback callback;
         boost::asio::steady_timer timer;
+        std::chrono::steady_clock::time_point sentAt;  // for round-trip latency
+        ert::metrics::labels_t additionalLabels;       // extra metric labels (reused for the answer)
         PendingRequest(boost::asio::io_context& io) : timer(io) {}
     };
 
@@ -207,6 +216,10 @@ class DiameterClient {
     ert::metrics::counter_family_t* requests_timedout_counter_family_ptr_{};
     ert::metrics::counter_family_t* requests_unsent_counter_family_ptr_{};
     ert::metrics::gauge_family_t* peer_state_gauge_family_ptr_{};
+
+    // Round-trip latency (correlated answer) histogram + optional additional label.
+    ert::metrics::histogram_family_t* response_delay_seconds_histogram_family_ptr_{};
+    ert::metrics::bucket_boundaries_t response_delay_seconds_histogram_bucket_boundaries_{};
 };
 
 }  // namespace diametercomm

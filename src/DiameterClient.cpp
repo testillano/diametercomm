@@ -31,6 +31,12 @@ uint32_t extractCommandCode(const Peer::Buffer& msg) {
     return (uint32_t(msg[5]) << 16) | (uint32_t(msg[6]) << 8) | uint32_t(msg[7]);
 }
 
+uint32_t extractApplicationId(const Peer::Buffer& msg) {
+    // Diameter header: application-id occupies bytes 8..11 (RFC 6733 section 3).
+    if (msg.size() < 20) return 0;
+    return (uint32_t(msg[8]) << 24) | (uint32_t(msg[9]) << 16) | (uint32_t(msg[10]) << 8) | uint32_t(msg[11]);
+}
+
 uint32_t extractResultCode(const Peer::Buffer& msg) {
     // Result-Code AVP (code 268): walk AVPs to find it.
     if (msg.size() < 20) return 0;
@@ -95,7 +101,24 @@ void DiameterClient::enableMetrics(ert::metrics::Metrics* metrics, const std::st
 
         peer_state_gauge_family_ptr_ = &(metrics_->addGaugeFamily(
             "diameter_client_peer_state_gauge", "Diameter client peer state (1=open, 0=closed)", familyLabels));
+
+        response_delay_seconds_histogram_family_ptr_ =
+            &(metrics_->addHistogramFamily("diameter_client_response_delay_seconds",
+                                           "Diameter client round-trip response delay (seconds)", familyLabels));
+        // Default buckets suited to Diameter round-trips (sub-ms to seconds).
+        response_delay_seconds_histogram_bucket_boundaries_ = {0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+                                                               0.1,    0.25,  0.5,    1.0,   2.5,  5.0,   10.0};
     }
+}
+
+ert::metrics::labels_t DiameterClient::clientLabels(const std::string& commandCode, const std::string& applicationId,
+                                                    const ert::metrics::labels_t& additionalLabels,
+                                                    const std::string& resultCode) const {
+    ert::metrics::labels_t labels = {
+        {"source", source_}, {"command_code", commandCode}, {"application_id", applicationId}};
+    if (!resultCode.empty()) labels["result_code"] = resultCode;
+    for (const auto& kv : additionalLabels) labels[kv.first] = kv.second;  // configured extra labels
+    return labels;
 }
 
 // ============================================================================
@@ -119,23 +142,22 @@ void DiameterClient::connect(const std::string& host, uint16_t port) {
 // ============================================================================
 // send
 // ============================================================================
-uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs) {
+uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs,
+                              const ert::metrics::labels_t& additionalLabels) {
     if (!peer_ || peer_->state() != Peer::State::Open) {
         if (metrics_ && request.size() >= 20) {
             std::string commandCode = std::to_string(extractCommandCode(request));
-            auto& counter =
-                requests_unsent_counter_family_ptr_->Add({{"source", source_}, {"command_code", commandCode}});
-            counter.Increment();
+            std::string applicationId = std::to_string(extractApplicationId(request));
+            requests_unsent_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, additionalLabels))
+                .Increment();
         }
         return 0;
     }
     if (request.size() < 20) return 0;
 
-    // Extract command code for metrics before moving the buffer
-    std::string commandCode;
-    if (metrics_) {
-        commandCode = std::to_string(extractCommandCode(request));
-    }
+    // Command code + application id for metric labels.
+    std::string commandCode = std::to_string(extractCommandCode(request));
+    std::string applicationId = std::to_string(extractApplicationId(request));
 
     // Assign hop-by-hop
     uint32_t hbh = extractHopByHop(request);
@@ -144,9 +166,11 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
         setHopByHop(request, hbh);
     }
 
-    // Register pending request
+    // Register pending request (cache send time + extra labels for the correlated answer)
     auto pending = std::make_shared<PendingRequest>(io_);
     pending->callback = std::move(onResponse);
+    pending->sentAt = std::chrono::steady_clock::now();
+    pending->additionalLabels = additionalLabels;
 
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -156,7 +180,8 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
     // Set timeout
     if (timeoutMs > 0) {
         pending->timer.expires_after(std::chrono::milliseconds(timeoutMs));
-        pending->timer.async_wait([this, hbh, commandCode](const boost::system::error_code& ec) {
+        pending->timer.async_wait([this, hbh, commandCode, applicationId,
+                                   additionalLabels](const boost::system::error_code& ec) {
             if (ec) return;  // cancelled
             std::shared_ptr<PendingRequest> req;
             {
@@ -167,9 +192,8 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
                 pending_.erase(it);
             }
             if (metrics_) {
-                auto& counter =
-                    requests_timedout_counter_family_ptr_->Add({{"source", source_}, {"command_code", commandCode}});
-                counter.Increment();
+                requests_timedout_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, additionalLabels))
+                    .Increment();
             }
             if (onTimeout_) onTimeout_(hbh);
         });
@@ -179,8 +203,7 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
     peer_->send(std::move(request));
 
     if (metrics_) {
-        auto& counter = requests_sent_counter_family_ptr_->Add({{"source", source_}, {"command_code", commandCode}});
-        counter.Increment();
+        requests_sent_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, additionalLabels)).Increment();
     }
 
     return hbh;
@@ -257,14 +280,6 @@ void DiameterClient::onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg) {
 
     // If it's an answer (not request), correlate by hop-by-hop
     if (!isRequest(msg)) {
-        if (metrics_) {
-            std::string commandCode = std::to_string(extractCommandCode(msg));
-            std::string resultCode = std::to_string(extractResultCode(msg));
-            auto& counter = answers_received_counter_family_ptr_->Add(
-                {{"source", source_}, {"command_code", commandCode}, {"result_code", resultCode}});
-            counter.Increment();
-        }
-
         uint32_t hbh = extractHopByHop(msg);
         std::shared_ptr<PendingRequest> req;
         {
@@ -275,6 +290,24 @@ void DiameterClient::onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg) {
                 pending_.erase(it);
             }
         }
+
+        if (metrics_) {
+            std::string commandCode = std::to_string(extractCommandCode(msg));
+            std::string applicationId = std::to_string(extractApplicationId(msg));
+            std::string resultCode = std::to_string(extractResultCode(msg));
+            ert::metrics::labels_t extra = req ? req->additionalLabels : ert::metrics::labels_t{};
+            answers_received_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, extra, resultCode))
+                .Increment();
+            // Round-trip latency: only for correlated answers (we know sentAt).
+            if (req) {
+                double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - req->sentAt).count();
+                response_delay_seconds_histogram_family_ptr_
+                    ->Add(clientLabels(commandCode, applicationId, extra),
+                          response_delay_seconds_histogram_bucket_boundaries_)
+                    .Observe(sec);
+            }
+        }
+
         if (req) {
             req->timer.cancel();
             if (req->callback) req->callback(msg);
