@@ -180,8 +180,7 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
     // Set timeout
     if (timeoutMs > 0) {
         pending->timer.expires_after(std::chrono::milliseconds(timeoutMs));
-        pending->timer.async_wait([this, hbh, commandCode, applicationId,
-                                   additionalLabels](const boost::system::error_code& ec) {
+        pending->timer.async_wait([this, hbh, commandCode, applicationId](const boost::system::error_code& ec) {
             if (ec) return;  // cancelled
             std::shared_ptr<PendingRequest> req;
             {
@@ -192,7 +191,8 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
                 pending_.erase(it);
             }
             if (metrics_) {
-                requests_timedout_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, additionalLabels))
+                requests_timedout_counter_family_ptr_
+                    ->Add(clientLabels(commandCode, applicationId, req->additionalLabels))
                     .Increment();
             }
             if (onTimeout_) onTimeout_(hbh);

@@ -35,8 +35,8 @@ std::shared_ptr<boost::asio::ssl::context> PeerConnection::makeServerContext(con
     ctx->set_options(boost::asio::ssl::context::default_workarounds | boost::asio::ssl::context::no_sslv2 |
                      boost::asio::ssl::context::no_sslv3 | boost::asio::ssl::context::single_dh_use);
     if (!tls.keyPassword.empty()) {
-        std::string pw = tls.keyPassword;
-        ctx->set_password_callback([pw](std::size_t, boost::asio::ssl::context::password_purpose) { return pw; });
+        ctx->set_password_callback(
+            [pw = tls.keyPassword](std::size_t, boost::asio::ssl::context::password_purpose) { return pw; });
     }
     ctx->use_certificate_chain_file(tls.certFile);
     ctx->use_private_key_file(tls.keyFile, boost::asio::ssl::context::pem);
@@ -62,8 +62,8 @@ std::shared_ptr<boost::asio::ssl::context> PeerConnection::makeClientContext(con
     // Optional client certificate (mTLS)
     if (!tls.certFile.empty() && !tls.keyFile.empty()) {
         if (!tls.keyPassword.empty()) {
-            std::string pw = tls.keyPassword;
-            ctx->set_password_callback([pw](std::size_t, boost::asio::ssl::context::password_purpose) { return pw; });
+            ctx->set_password_callback(
+                [pw = tls.keyPassword](std::size_t, boost::asio::ssl::context::password_purpose) { return pw; });
         }
         ctx->use_certificate_chain_file(tls.certFile);
         ctx->use_private_key_file(tls.keyFile, boost::asio::ssl::context::pem);
