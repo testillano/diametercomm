@@ -224,8 +224,8 @@ bool DiameterServer::sendAnswer(std::shared_ptr<Peer> peer, Peer::Buffer answer)
 }
 
 ert::metrics::labels_t DiameterServer::serverLabels(const std::string& commandCode, const std::string& applicationId,
-                                                   const ert::metrics::labels_t& additionalLabels,
-                                                   const std::string& resultCode) const {
+                                                    const ert::metrics::labels_t& additionalLabels,
+                                                    const std::string& resultCode) const {
     ert::metrics::labels_t labels = {
         {"source", source_}, {"command_code", commandCode}, {"application_id", applicationId}};
     if (!resultCode.empty()) labels["result_code"] = resultCode;

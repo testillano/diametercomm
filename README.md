@@ -264,7 +264,18 @@ The client will connect, perform CER/CEA, send a request with the given command 
 
 ## Contributing
 
-Please, execute `clang-format` formatting before any pull request:
+Please, run the format check before any pull request (the CI enforces the same
+check with the same clang-format image before building):
+
+```bash
+$ ./format.sh          # check only (dry-run -Werror), like CI
+$ ./format.sh --fix    # reformat in place
+```
+
+`format.sh` uses the CI clang-format Docker image, so a local pass guarantees the
+CI passes regardless of any clang-format version installed on your machine.
+
+Alternatively, run `clang-format` directly:
 
 ```bash
 $ sources=$(find . -name "*.hpp" -o -name "*.cpp")
