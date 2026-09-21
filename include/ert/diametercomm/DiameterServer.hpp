@@ -36,6 +36,7 @@ Copyright (c) 2024 Eduardo Ramos
 #pragma once
 
 #include <boost/asio.hpp>
+#include <chrono>
 #include <cstdint>
 #include <ert/diametercomm/Peer.hpp>
 #include <ert/metrics/Metrics.hpp>
@@ -43,6 +44,7 @@ Copyright (c) 2024 Eduardo Ramos
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ert {
@@ -65,6 +67,10 @@ class DiameterServer {
    public:
     using RequestCallback = std::function<void(std::shared_ptr<Peer>, Peer::Buffer &&)>;
     using PeerEventCallback = std::function<void(std::shared_ptr<Peer>, Peer::State)>;
+    // Bidirectional Diameter (RFC 6733): the server may itself initiate a
+    // request (e.g. RAR) on a connected peer and correlate the incoming answer.
+    using ResponseCallback = std::function<void(const Peer::Buffer &response)>;
+    using TimeoutCallback = std::function<void(uint32_t hopByHop)>;
 
     /**
      * @param io       io_context for async operations
@@ -114,6 +120,27 @@ class DiameterServer {
     // --- Callbacks ---
     void setRequestCallback(RequestCallback cb) { onRequest_ = std::move(cb); }
     void setPeerEventCallback(PeerEventCallback cb) { onPeerEvent_ = std::move(cb); }
+    /** Called when a server-initiated request (sendRequest) times out. */
+    void setTimeoutCallback(TimeoutCallback cb) { onTimeout_ = std::move(cb); }
+
+    /**
+     * Send a server-initiated Diameter request through the given peer and
+     * register a callback for the correlated answer (bidirectional Diameter,
+     * RFC 6733). Hop-by-hop is auto-assigned if zero. Mirrors
+     * DiameterClient::send: it tracks a pending transaction keyed by hop-by-hop,
+     * arms a timeout, and (when metrics are enabled) increments
+     * diameter_server_requests_sent_counter; the correlated answer increments
+     * diameter_server_answers_received_counter.
+     *
+     * @param peer       The peer to send the request through.
+     * @param request    Complete Diameter request message.
+     * @param onResponse Called when the correlated answer arrives.
+     * @param timeoutMs  Timeout in milliseconds (0 = no timeout).
+     * @param additionalLabels Extra metric labels reused for the correlated answer.
+     * @return hop-by-hop ID used, or 0 if the send failed (e.g. null peer).
+     */
+    uint32_t sendRequest(std::shared_ptr<Peer> peer, Peer::Buffer request, ResponseCallback onResponse,
+                         uint32_t timeoutMs = 5000, const ert::metrics::labels_t &additionalLabels = {});
 
     /**
      * Send a Diameter answer through the given peer, incrementing metrics.
@@ -143,6 +170,22 @@ class DiameterServer {
     void doAccept();
     void onPeerStateChange(std::shared_ptr<Peer> peer, Peer::State state);
 
+    // Build the server metric label set: base {source, command_code,
+    // application_id} plus result_code (answers only) and any configured extra
+    // labels. Mirrors DiameterClient::clientLabels.
+    ert::metrics::labels_t serverLabels(const std::string &commandCode, const std::string &applicationId,
+                                        const ert::metrics::labels_t &additionalLabels,
+                                        const std::string &resultCode = "") const;
+
+    // Pending server-initiated transaction (awaiting the correlated answer).
+    struct PendingRequest {
+        ResponseCallback callback;
+        boost::asio::steady_timer timer;
+        std::chrono::steady_clock::time_point sentAt;
+        ert::metrics::labels_t additionalLabels;
+        PendingRequest(boost::asio::io_context &io) : timer(io) {}
+    };
+
     boost::asio::io_context &io_;
     boost::asio::ip::tcp::acceptor acceptor_;
     Peer::Config config_;
@@ -154,7 +197,12 @@ class DiameterServer {
 
     RequestCallback onRequest_;
     PeerEventCallback onPeerEvent_;
+    TimeoutCallback onTimeout_;
     bool listening_{false};
+
+    // Correlation map for server-initiated requests: hop-by-hop -> pending.
+    mutable std::mutex pendingMutex_;
+    std::unordered_map<uint32_t, std::shared_ptr<PendingRequest>> pending_;
 
     // --- Metrics members ---
     ert::metrics::Metrics *metrics_{};
@@ -164,6 +212,9 @@ class DiameterServer {
     ert::metrics::counter_family_t *answers_sent_counter_family_ptr_{};
     ert::metrics::counter_family_t *peer_connections_counter_family_ptr_{};
     ert::metrics::gauge_family_t *active_peers_gauge_family_ptr_{};
+    // Bidirectional (RFC 6733): server-initiated requests and their answers.
+    ert::metrics::counter_family_t *requests_sent_counter_family_ptr_{};
+    ert::metrics::counter_family_t *answers_received_counter_family_ptr_{};
 };
 
 }  // namespace diametercomm

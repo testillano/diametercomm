@@ -51,6 +51,43 @@ class DiameterServer_test : public ::testing::Test {
         msg[11] = 4;
         return msg;
     }
+
+    // Helper: build a minimal Re-Auth-Request (command code 258, R-bit set),
+    // hop-by-hop optionally preset (0 lets sendRequest assign it).
+    static Peer::Buffer buildRar(uint32_t hbh = 0) {
+        Peer::Buffer msg(20, 0);
+        msg[0] = 1;
+        msg[3] = 20;
+        msg[4] = 0x80;  // R-bit -> request
+        msg[6] = 1;
+        msg[7] = 0x02;  // 258 = RAR
+        msg[11] = 4;    // application-id low byte (test appId 4)
+        msg[12] = static_cast<uint8_t>(hbh >> 24);
+        msg[13] = static_cast<uint8_t>(hbh >> 16);
+        msg[14] = static_cast<uint8_t>(hbh >> 8);
+        msg[15] = static_cast<uint8_t>(hbh);
+        return msg;
+    }
+
+    // Helper: build a minimal Re-Auth-Answer (258, R-bit clear) echoing hbh.
+    static Peer::Buffer buildRaa(uint32_t hbh) {
+        Peer::Buffer msg(20, 0);
+        msg[0] = 1;
+        msg[3] = 20;
+        msg[4] = 0x00;  // answer
+        msg[6] = 1;
+        msg[7] = 0x02;  // 258 = RAA
+        msg[11] = 4;
+        msg[12] = static_cast<uint8_t>(hbh >> 24);
+        msg[13] = static_cast<uint8_t>(hbh >> 16);
+        msg[14] = static_cast<uint8_t>(hbh >> 8);
+        msg[15] = static_cast<uint8_t>(hbh);
+        return msg;
+    }
+
+    static uint32_t extractHopByHop(const Peer::Buffer& msg) {
+        return (uint32_t(msg[12]) << 24) | (uint32_t(msg[13]) << 16) | (uint32_t(msg[14]) << 8) | uint32_t(msg[15]);
+    }
 };
 
 TEST_F(DiameterServer_test, ListenAndAcceptSinglePeer) {
@@ -123,6 +160,83 @@ TEST_F(DiameterServer_test, RequestCallbackDelivery) {
     EXPECT_EQ(cmdCode, 272u);
 
     server.close();
+}
+
+// =============================================================================
+// Gap B: server-initiated request (bidirectional Diameter, RFC 6733). The
+// server PUSHES a request (e.g. RAR) down a connected peer and correlates the
+// incoming answer (RAA) by hop-by-hop, mirroring DiameterClient::send.
+// =============================================================================
+
+TEST_F(DiameterServer_test, ServerSendsRequestAndReceivesCorrelatedAnswer) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 13874);
+
+    // The connected peer answers any request it receives with a correlated RAA.
+    auto client = std::make_shared<Peer>(io_, clientConfig());
+    client->setRequestCallback([&](std::shared_ptr<Peer> p, Peer::Buffer&& msg) {
+        uint32_t hbh = extractHopByHop(msg);
+        p->send(buildRaa(hbh));
+    });
+
+    Peer::Buffer answer;
+    std::atomic<bool> gotAnswer{false};
+    server.setPeerEventCallback([&](std::shared_ptr<Peer> peer, Peer::State s) {
+        if (s == Peer::State::Open) {
+            // hbh=0 -> sendRequest must assign a non-zero hop-by-hop.
+            server.sendRequest(
+                peer, buildRar(0),
+                [&](const Peer::Buffer& raa) {
+                    answer = raa;
+                    gotAnswer = true;
+                },
+                5000);
+        }
+    });
+
+    client->connect("127.0.0.1", 13874);
+    runFor(std::chrono::milliseconds(700));
+
+    ASSERT_TRUE(gotAnswer);
+    ASSERT_GE(answer.size(), 20u);
+    EXPECT_EQ(answer[4] & 0x80, 0);  // it is an answer (R-bit clear)
+    uint32_t cmdCode = (uint32_t(answer[5]) << 16) | (uint32_t(answer[6]) << 8) | uint32_t(answer[7]);
+    EXPECT_EQ(cmdCode, 258u);  // RAA
+
+    server.close();
+}
+
+TEST_F(DiameterServer_test, ServerRequestTimesOut) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 13875);
+
+    // The connected peer receives the request but never answers.
+    auto client = std::make_shared<Peer>(io_, clientConfig());
+    client->setRequestCallback([](std::shared_ptr<Peer>, Peer::Buffer&&) {});
+
+    std::atomic<bool> timedOut{false};
+    server.setTimeoutCallback([&](uint32_t) { timedOut = true; });
+    server.setPeerEventCallback([&](std::shared_ptr<Peer> peer, Peer::State s) {
+        if (s == Peer::State::Open) {
+            server.sendRequest(
+                peer, buildRar(0), [](const Peer::Buffer&) { FAIL() << "Should not receive an answer"; },
+                200);  // 200 ms timeout
+        }
+    });
+
+    client->connect("127.0.0.1", 13875);
+    runFor(std::chrono::milliseconds(600));
+
+    EXPECT_TRUE(timedOut);
+
+    server.close();
+}
+
+TEST_F(DiameterServer_test, SendRequestFailsWhenPeerNull) {
+    DiameterServer server(io_, serverConfig());
+    // No peer connected; sending on a null peer must fail cleanly (hbh 0).
+    uint32_t hbh = server.sendRequest(nullptr, buildRar(0), [](const Peer::Buffer&) {}, 1000);
+    EXPECT_EQ(hbh, 0u);
 }
 
 TEST_F(DiameterServer_test, GracefulShutdown) {

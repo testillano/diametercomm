@@ -118,6 +118,20 @@ class DiameterClient {
                   const ert::metrics::labels_t& additionalLabels = {});
 
     /**
+     * Send a Diameter answer back on this client connection.
+     *
+     * Bidirectional Diameter: when the client RECEIVES a server-initiated
+     * request (delivered via the request callback), the application builds the
+     * answer and sends it back on the SAME connection with this method. It
+     * mirrors DiameterServer::sendAnswer: it sends through the peer and, when
+     * metrics are enabled, increments diameter_client_answers_sent_counter.
+     *
+     * @param answer Complete Diameter answer message.
+     * @return true if the send succeeded, false otherwise (e.g. not connected).
+     */
+    bool sendAnswer(Buffer answer);
+
+    /**
      * Graceful disconnect (DPR/DPA).
      */
     void disconnect(uint32_t cause = 0);
@@ -215,6 +229,14 @@ class DiameterClient {
     ert::metrics::counter_family_t* answers_received_counter_family_ptr_{};
     ert::metrics::counter_family_t* requests_timedout_counter_family_ptr_{};
     ert::metrics::counter_family_t* requests_unsent_counter_family_ptr_{};
+    // Bidirectional Diameter (RFC 6733): after CER/CEA either peer may send
+    // requests on the same connection. A client can therefore RECEIVE a
+    // server-initiated request (e.g. RAR/DPR) and must SEND the answer back on
+    // the same leg. These two families count that inbound-on-client traffic
+    // (the request-sent/answer-received families above stay for the classic
+    // client-initiated transactions).
+    ert::metrics::counter_family_t* requests_received_counter_family_ptr_{};
+    ert::metrics::counter_family_t* answers_sent_counter_family_ptr_{};
     ert::metrics::gauge_family_t* peer_state_gauge_family_ptr_{};
 
     // Round-trip latency (correlated answer) histogram + optional additional label.

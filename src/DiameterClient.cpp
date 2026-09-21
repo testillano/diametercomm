@@ -99,6 +99,14 @@ void DiameterClient::enableMetrics(ert::metrics::Metrics* metrics, const std::st
         requests_unsent_counter_family_ptr_ = &(metrics_->addCounterFamily(
             "diameter_client_requests_unsent_counter", "Diameter client requests unsent counter", familyLabels));
 
+        // Bidirectional (RFC 6733): inbound requests received on the client leg
+        // (server-initiated, e.g. RAR/DPR) and answers we send back on it.
+        requests_received_counter_family_ptr_ = &(metrics_->addCounterFamily(
+            "diameter_client_requests_received_counter", "Diameter client requests received counter", familyLabels));
+
+        answers_sent_counter_family_ptr_ = &(metrics_->addCounterFamily(
+            "diameter_client_answers_sent_counter", "Diameter client answers sent counter", familyLabels));
+
         peer_state_gauge_family_ptr_ = &(metrics_->addGaugeFamily(
             "diameter_client_peer_state_gauge", "Diameter client peer state (1=open, 0=closed)", familyLabels));
 
@@ -210,6 +218,22 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
 }
 
 // ============================================================================
+// sendAnswer - reply to a server-initiated request on this connection
+// ============================================================================
+bool DiameterClient::sendAnswer(Buffer answer) {
+    if (!peer_ || answer.size() < 20) return false;
+
+    if (metrics_) {
+        std::string commandCode = std::to_string(extractCommandCode(answer));
+        std::string applicationId = std::to_string(extractApplicationId(answer));
+        std::string resultCode = std::to_string(extractResultCode(answer));
+        answers_sent_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, {}, resultCode)).Increment();
+    }
+
+    return peer_->send(std::move(answer));
+}
+
+// ============================================================================
 // disconnect
 // ============================================================================
 void DiameterClient::disconnect(uint32_t cause) {
@@ -317,6 +341,11 @@ void DiameterClient::onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg) {
 
     // Unsolicited request from the server side
     if (onRequest_) {
+        if (metrics_) {
+            std::string commandCode = std::to_string(extractCommandCode(msg));
+            std::string applicationId = std::to_string(extractApplicationId(msg));
+            requests_received_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, {})).Increment();
+        }
         onRequest_(std::move(peer), std::move(msg));
     }
 }

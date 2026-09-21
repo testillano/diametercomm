@@ -280,6 +280,64 @@ TEST_F(DiameterClient_test, UnsolicitedRequestFromServer) {
     server.close();
 }
 
+// Bidirectional Diameter (RFC 6733), end-to-end: the server PUSHES a
+// server-initiated request (e.g. RAR) via sendRequest() down the connection the
+// client opened; the client receives it and replies with sendAnswer() on the
+// SAME leg; the server correlates the incoming answer (RAA) by hop-by-hop and
+// invokes its response callback. Exercises DiameterClient::sendAnswer AND
+// DiameterServer::sendRequest correlation together.
+TEST_F(DiameterClient_test, ClientAnswersServerInitiatedRequest) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 14874);
+
+    // Client: when it receives the server-initiated request, reply on the same
+    // connection with a correlated answer via sendAnswer().
+    DiameterClient client(io_, clientConfig());
+    client.setReconnectEnabled(false);
+    std::atomic<bool> clientReceivedRequest{false};
+    client.setRequestCallback([&](std::shared_ptr<Peer>, Peer::Buffer&& msg) {
+        clientReceivedRequest = true;
+        uint32_t hbh = extractHopByHop(msg);
+        EXPECT_TRUE((msg[4] & 0x80) != 0);  // it is a request (R-bit set)
+        client.sendAnswer(buildAppAnswer(hbh));
+    });
+
+    // Server: on peer Open, push the request via sendRequest and capture the
+    // correlated answer through the response callback.
+    Peer::Buffer answerAtServer;
+    std::atomic<bool> serverGotAnswer{false};
+    server.setPeerEventCallback([&](std::shared_ptr<Peer> peer, Peer::State s) {
+        if (s == Peer::State::Open) {
+            server.sendRequest(
+                peer, buildAppRequest(),  // hbh=0 -> server assigns it
+                [&](const Peer::Buffer& raa) {
+                    answerAtServer = raa;
+                    serverGotAnswer = true;
+                },
+                5000);
+        }
+    });
+
+    client.connect("127.0.0.1", 14874);
+    runFor(std::chrono::milliseconds(700));
+
+    ASSERT_TRUE(clientReceivedRequest);
+    ASSERT_TRUE(serverGotAnswer);
+    ASSERT_GE(answerAtServer.size(), 20u);
+    EXPECT_EQ(answerAtServer[4] & 0x80, 0);  // it is an answer (R-bit clear)
+
+    client.close();
+    server.close();
+}
+
+// sendAnswer() must fail cleanly when the client is not connected (no peer),
+// mirroring send()'s not-connected guard.
+TEST_F(DiameterClient_test, SendAnswerFailsWhenNotConnected) {
+    DiameterClient client(io_, clientConfig());
+    client.setReconnectEnabled(false);
+    EXPECT_FALSE(client.sendAnswer(buildAppAnswer(0x1)));
+}
+
 // =============================================================================
 // SCTP single-homing (client transport). Exercises the DiameterClient ->
 // Peer -> PeerConnection SCTP plumbing (G1) against an SCTP DiameterServer.
