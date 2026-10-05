@@ -116,8 +116,41 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
 
     /**
      * Connect to a remote Diameter peer (client-side).
+     *
+     * @param localAddress  Optional local source address to bind before
+     *   connecting.
+     *
+     *   For SCTP this SINGLE-HOMES the association: the INIT advertises only this
+     *   one address instead of every local interface. That matters because an
+     *   unbound (INADDR_ANY) SCTP client advertises ALL host addresses as
+     *   candidate paths -- including non-routable ones (docker0 192.168.x,
+     *   bridges 172.17.x, management NICs) -- which the peer cannot reach, so the
+     *   handshake stalls in COOKIE_WAIT.
+     *
+     *   Semantics:
+     *     - empty (default): auto-derive the kernel egress source toward the peer
+     *       (see deriveSourceAddress) -- i.e. the `src` of `ip route get <peer>`.
+     *       This matches where traffic actually leaves from. If derivation fails,
+     *       the socket is left unbound (legacy behavior).
+     *     - non-empty: explicit override -- bind exactly to this address. Use it
+     *       to PIN the egress interface when the default route picks a path the
+     *       peer does not accept (asymmetric routing, or a VIP reachable only via
+     *       a specific interface). The caller must supply an address the host can
+     *       egress from and the peer can reach.
+     *
+     *   Harmless for TCP (pins the source address; no multihoming involved).
      */
-    void asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected, ErrorCallback onError);
+    void asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected, ErrorCallback onError,
+                      const std::string& localAddress = "");
+
+    /**
+     * Derive the local source address the kernel would use to reach @p peer,
+     * without sending any traffic (connected-UDP + getsockname trick). Returns
+     * an empty string on failure. Equivalent to the @c src field of
+     * @c "ip route get <peer>". Used by asyncConnect to single-home the SCTP
+     * client to the egress address (see asyncConnect's @p localAddress).
+     */
+    static std::string deriveSourceAddress(const boost::asio::ip::address& peer);
 
     /**
      * Start reading Diameter messages from the connection.

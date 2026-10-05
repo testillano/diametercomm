@@ -93,6 +93,17 @@ class Peer : public std::enable_shared_from_this<Peer> {
         uint32_t watchdogIntervalSec{30};      // DWR interval (0 = disabled)
         std::vector<uint32_t> applicationIds;  // Supported applications (advertised in CER/CEA)
         TlsConfig tls;                         // TLS/TCP security (disabled by default; TCP only)
+        // Local source address to bind the OUTBOUND client connection to.
+        //   - empty (default): auto-derive the egress source toward the peer
+        //     (the `src` of `ip route get <peer>`); the SCTP INIT then advertises
+        //     only that address.
+        //   - non-empty: explicit override to PIN a specific egress address (e.g.
+        //     when the default route picks an interface the peer will not answer).
+        // For SCTP this single-homes the association, avoiding advertisement of
+        // non-routable local interfaces (docker0, bridges) that would stall the
+        // handshake in COOKIE_WAIT. See PeerConnection::asyncConnect for details.
+        // Kept LAST in this struct to preserve positional aggregate initializers.
+        std::string localAddress;
     };
 
     /**

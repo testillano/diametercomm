@@ -241,12 +241,15 @@ void Peer::connect(const std::string& host, uint16_t port) {
             self->connection_->startReading([self](Buffer&& msg) { self->onMessage(std::move(msg)); },
                                             [self](const boost::system::error_code& ec) { self->onError(ec); });
         },
-        [self](const boost::system::error_code& ec) { self->onError(ec); });
+        [self](const boost::system::error_code& ec) { self->onError(ec); },
+        // Local source address for the outbound connection (empty = auto-derive
+        // egress toward peer). For SCTP this single-homes the INIT; see
+        // Config::localAddress and PeerConnection::asyncConnect.
+        config_.localAddress);
 }
 
 // ============================================================================
 // start (server-side)
-// ============================================================================
 void Peer::start() {
     setState(State::WaitCER);
     auto self = shared_from_this();

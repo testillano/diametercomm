@@ -11,6 +11,7 @@ Licensed under the MIT License. Copyright (c) 2024 Eduardo Ramos
 
 #include <cstring>
 #include <ert/diametercomm/PeerConnection.hpp>
+#include <ert/tracing/Logger.hpp>
 #include <sstream>
 
 namespace ert {
@@ -96,17 +97,70 @@ void PeerConnection::asyncHandshakeServer(std::function<void()> onDone, ErrorCal
 }
 
 // ============================================================================
+// deriveSourceAddress (client-side helper)
+// ============================================================================
+//
+// Returns the local source IP the kernel would use to reach `peer` -- i.e. the
+// exact `src` field of `ip route get <peer>` -- or "" if it cannot be resolved.
+//
+// WHY THIS EXISTS (SCTP multihoming vs a multi-interface host):
+//   A client socket left unbound (INADDR_ANY / 0.0.0.0) does NOT send from
+//   "0.0.0.0" -- that is a wildcard meaning "let the kernel choose". The kernel
+//   picks the egress interface from the ROUTING TABLE toward the destination and
+//   uses that interface's address as the packet source. For TCP that is the end
+//   of the story (one source address, replies come back to it).
+//
+//   SCTP is different: it is multihomed. In its INIT chunk the client ADVERTISES
+//   its local addresses as candidate paths. An unbound SCTP socket on a host with
+//   several interfaces advertises ALL of them -- including addresses that are NOT
+//   routable from the peer (e.g. Docker's docker0 192.168.x, bridges 172.17.x,
+//   or management NICs). The peer then cannot return INIT-ACK / verify those
+//   paths and the association stalls in COOKIE_WAIT (handshake never completes).
+//
+//   To avoid that we SINGLE-HOME the association: bind the socket to ONE local
+//   address before connecting, so the INIT advertises only that address. The
+//   right address to advertise is precisely the egress source toward the peer --
+//   advertising anything else (an address the traffic does not actually leave
+//   from) would itself break SCTP path verification.
+//
+// HOW IT WORKS (connected-UDP + getsockname, no traffic sent):
+//   Creating a UDP socket and `connect()`-ing it to the peer does NOT send any
+//   datagram; it only makes the kernel resolve the route and bind the socket's
+//   local end to the source address it would use. `getsockname()` (via
+//   local_endpoint()) then reveals that source IP. This mirrors `ip route get`
+//   without shelling out to a binary, and works for both IPv4 and IPv6.
+//
+// NOTE: this derives the address of the route the kernel ALREADY has. It cannot
+//   fix a wrong/missing route or a peer that only accepts traffic via a different
+//   path -- those are network/routing problems to solve outside the client (or by
+//   pinning an explicit source via Peer::Config::localAddress; see asyncConnect).
+std::string PeerConnection::deriveSourceAddress(const boost::asio::ip::address& peer) {
+    try {
+        boost::asio::io_context tmp;
+        boost::asio::ip::udp::socket probe(tmp, peer.is_v6() ? boost::asio::ip::udp::v6() : boost::asio::ip::udp::v4());
+        boost::system::error_code ec;
+        probe.connect(boost::asio::ip::udp::endpoint(peer, 9 /* discard; no datagram sent */), ec);
+        if (ec) return "";
+        auto local = probe.local_endpoint(ec);
+        if (ec) return "";
+        return local.address().to_string();
+    } catch (...) {
+        return "";
+    }
+}
+
+// ============================================================================
 // asyncConnect (client-side)
 // ============================================================================
 void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected,
-                                  ErrorCallback onError) {
+                                  ErrorCallback onError, const std::string& localAddress) {
     auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(socket_.get_executor());
 
     auto self = shared_from_this();
     resolver->async_resolve(
         host, std::to_string(port),
-        [self, resolver, onConnected, onError](const boost::system::error_code& ec,
-                                               boost::asio::ip::tcp::resolver::results_type results) {
+        [self, resolver, onConnected, onError, localAddress](const boost::system::error_code& ec,
+                                                             boost::asio::ip::tcp::resolver::results_type results) {
             if (ec) {
                 if (onError) onError(ec);
                 return;
@@ -134,6 +188,69 @@ void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::f
                     ::close(fd);
                     if (onError) onError(assign_ec);
                     return;
+                }
+
+                // SCTP single-homing: bind the socket to ONE local source
+                // address before connecting, so the INIT advertises only that
+                // address (not every local interface). See deriveSourceAddress()
+                // above for the full rationale (SCTP multihoming would otherwise
+                // advertise non-routable addresses like docker0 and stall the
+                // handshake in COOKIE_WAIT).
+                //
+                // Address selection:
+                //   - localAddress NON-EMPTY  -> explicit override: bind exactly
+                //     to it. Use this to PIN the egress interface when the kernel
+                //     route would pick a path the peer does not accept (asymmetric
+                //     routing, or a VIP reachable only via a specific interface).
+                //     The caller is responsible for providing an address the peer
+                //     can actually reach (and that the host can egress from).
+                //   - localAddress EMPTY (default) -> auto-derive the egress source
+                //     toward the peer (deriveSourceAddress). This is the kernel's
+                //     own route decision, so the advertised address matches where
+                //     the traffic actually leaves from.
+                //   - derivation fails -> leave the socket unbound (legacy
+                //     behavior); better to try than to abort the connect.
+                //
+                // A failed bind (e.g. the given address is not local) is surfaced
+                // via onError rather than silently ignored.
+                {
+                    std::string local = localAddress;
+                    bool explicitPin = !local.empty();
+                    if (local.empty()) local = PeerConnection::deriveSourceAddress(it->endpoint().address());
+                    if (!local.empty()) {
+                        boost::system::error_code addr_ec;
+                        auto laddr = boost::asio::ip::make_address(local, addr_ec);
+                        if (!addr_ec) {
+                            boost::system::error_code bind_ec;
+                            self->socket_.bind(boost::asio::ip::tcp::endpoint(laddr, 0), bind_ec);
+                            if (bind_ec) {
+                                if (onError) onError(bind_ec);
+                                return;
+                            }
+                            // Startup visibility: report the single local source address the
+                            // SCTP INIT will advertise, and whether it was pinned explicitly
+                            // (--diameter-client-local-host / Config::localAddress) or
+                            // auto-derived from the route toward the peer.
+                            LOGWARNING(ert::tracing::Logger::warning(
+                                ert::tracing::Logger::asString(
+                                    "SCTP client source address (advertised in INIT): %s [%s]", local.c_str(),
+                                    explicitPin ? "explicit" : "auto-derived"),
+                                ERT_FILE_LOCATION));
+                        } else if (explicitPin) {
+                            // An explicit address that does not parse is a config error worth flagging.
+                            LOGWARNING(ert::tracing::Logger::warning(
+                                ert::tracing::Logger::asString(
+                                    "SCTP client local address '%s' is not a valid IP; leaving socket unbound",
+                                    local.c_str()),
+                                ERT_FILE_LOCATION));
+                        }
+                    } else {
+                        // Could not determine a source address: unbound (legacy multihomed INIT).
+                        LOGWARNING(ert::tracing::Logger::warning(
+                            "SCTP client source address could not be derived; socket left unbound "
+                            "(INIT will advertise all local addresses)",
+                            ERT_FILE_LOCATION));
+                    }
                 }
 
                 // Single-homing: connect the assigned SCTP socket to the single
