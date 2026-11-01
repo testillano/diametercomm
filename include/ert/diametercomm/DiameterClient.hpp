@@ -81,6 +81,19 @@ class DiameterClient {
     using TimeoutCallback = std::function<void(uint32_t hopByHop)>;
     using RequestCallback = std::function<void(std::shared_ptr<Peer>, Buffer&&)>;
     using StateCallback = std::function<void(Peer::State)>;
+    /**
+     * Per-transaction timeout notification: lets the sender complete its own
+     * pending work (e.g. answer an HTTP/2 stream) when no answer arrives. The
+     * argument is the hop-by-hop of the expired request.
+     */
+    using TransactionTimeoutCallback = std::function<void(uint32_t hopByHop)>;
+    /**
+     * Called for an answer (R-bit clear) that matches no pending transaction of
+     * this connection. Return true if the application resolved it elsewhere
+     * (e.g. another leg); false lets the client drop it with a Warning log and
+     * the uncorrelated metric. Answers are never delivered as requests.
+     */
+    using UnmatchedAnswerCallback = std::function<bool(const Buffer& answer)>;
 
     /**
      * @param io        io_context for async operations
@@ -112,10 +125,29 @@ class DiameterClient {
      * @param request   Complete Diameter request message
      * @param onResponse Called when the correlated answer arrives
      * @param timeoutMs  Timeout in milliseconds (0 = no timeout)
-     * @return hop-by-hop ID used, or 0 if send failed (not connected)
+     * @param additionalLabels Extra metric labels reused for the correlated answer
+     * @param onTimeout  Optional: called (once) if the transaction expires
+     * @return hop-by-hop ID used, or 0 if send failed (not connected or write
+     *         refused). On 0 no callback is invoked: the caller handles it.
+     *
+     * End-to-end is also assigned here if zero (node-wide sequence), so the
+     * transaction can be correlated by end-to-end when the answer comes back
+     * with a different hop-by-hop (see tryResolve).
      */
     uint32_t send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs = 5000,
-                  const ert::metrics::labels_t& additionalLabels = {});
+                  const ert::metrics::labels_t& additionalLabels = {}, TransactionTimeoutCallback onTimeout = {});
+
+    /**
+     * Try to correlate an answer received on ANOTHER leg/connection with a
+     * pending transaction of this client: lookup by hop-by-hop, then by
+     * end-to-end (RFC 6733 keeps it unchanged end to end). The command code
+     * must match. On success the pending entry is removed, its timer cancelled,
+     * metrics updated (plus diameter_client_answers_recovered_counter) and the
+     * response callback invoked.
+     *
+     * @return true if the answer was resolved by this client.
+     */
+    bool tryResolve(const Buffer& answer);
 
     /**
      * Send a Diameter answer back on this client connection.
@@ -158,6 +190,8 @@ class DiameterClient {
     void setStateCallback(StateCallback cb) { onState_ = std::move(cb); }
     /** Called when a response times out */
     void setTimeoutCallback(TimeoutCallback cb) { onTimeout_ = std::move(cb); }
+    /** Called for an answer that matches no pending transaction (see UnmatchedAnswerCallback) */
+    void setUnmatchedAnswerCallback(UnmatchedAnswerCallback cb) { onUnmatchedAnswer_ = std::move(cb); }
 
     // --- Reconnect configuration ---
     void setReconnectEnabled(bool enabled) { reconnectEnabled_ = enabled; }
@@ -184,6 +218,10 @@ class DiameterClient {
     void onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg);
     void scheduleReconnect();
 
+    // Correlate an answer with a pending transaction (hbh, then e2e). Shared by
+    // the local answer path and tryResolve (crossLeg=true).
+    bool resolve(const Buffer& answer, bool crossLeg);
+
     // Build the metric label set: base {source, command_code, application_id}
     // plus result_code (answers only) and any configured additional labels.
     ert::metrics::labels_t clientLabels(const std::string& commandCode, const std::string& applicationId,
@@ -192,6 +230,9 @@ class DiameterClient {
 
     struct PendingRequest {
         ResponseCallback callback;
+        TransactionTimeoutCallback onTimeout;
+        uint32_t endToEnd{0};
+        uint32_t commandCode{0};
         boost::asio::steady_timer timer;
         std::chrono::steady_clock::time_point sentAt;  // for round-trip latency
         ert::metrics::labels_t additionalLabels;       // extra metric labels (reused for the answer)
@@ -209,6 +250,8 @@ class DiameterClient {
     // Correlation map: hop-by-hop -> pending request
     mutable std::mutex pendingMutex_;
     std::unordered_map<uint32_t, std::shared_ptr<PendingRequest>> pending_;
+    // Secondary index: end-to-end -> hop-by-hop (fallback correlation key)
+    std::unordered_map<uint32_t, uint32_t> pendingByE2e_;
 
     // Reconnect state
     bool reconnectEnabled_{true};
@@ -220,6 +263,7 @@ class DiameterClient {
     RequestCallback onRequest_;
     StateCallback onState_;
     TimeoutCallback onTimeout_;
+    UnmatchedAnswerCallback onUnmatchedAnswer_;
 
     // --- Metrics members ---
     ert::metrics::Metrics* metrics_{};
@@ -238,6 +282,10 @@ class DiameterClient {
     ert::metrics::counter_family_t* requests_received_counter_family_ptr_{};
     ert::metrics::counter_family_t* answers_sent_counter_family_ptr_{};
     ert::metrics::gauge_family_t* peer_state_gauge_family_ptr_{};
+    // Answers dropped because no pending transaction matches (on any leg).
+    ert::metrics::counter_family_t* answers_uncorrelated_counter_family_ptr_{};
+    // Answers correlated by a fallback path: by end-to-end and/or cross-leg.
+    ert::metrics::counter_family_t* answers_recovered_counter_family_ptr_{};
 
     // Round-trip latency (correlated answer) histogram + optional additional label.
     ert::metrics::histogram_family_t* response_delay_seconds_histogram_family_ptr_{};

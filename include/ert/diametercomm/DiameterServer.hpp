@@ -71,6 +71,15 @@ class DiameterServer {
     // request (e.g. RAR) on a connected peer and correlate the incoming answer.
     using ResponseCallback = std::function<void(const Peer::Buffer &response)>;
     using TimeoutCallback = std::function<void(uint32_t hopByHop)>;
+    /** Per-transaction timeout notification (see DiameterClient::TransactionTimeoutCallback). */
+    using TransactionTimeoutCallback = std::function<void(uint32_t hopByHop)>;
+    /**
+     * Called for an inbound answer (R-bit clear) that matches no pending
+     * server-initiated transaction. Return true if the application resolved it
+     * elsewhere (e.g. on the client leg, see DiameterClient::tryResolve); false
+     * lets the server drop it with a Warning log and the uncorrelated metric.
+     */
+    using UnmatchedAnswerCallback = std::function<bool(std::shared_ptr<Peer>, const Peer::Buffer &answer)>;
 
     /**
      * @param io       io_context for async operations
@@ -122,6 +131,8 @@ class DiameterServer {
     void setPeerEventCallback(PeerEventCallback cb) { onPeerEvent_ = std::move(cb); }
     /** Called when a server-initiated request (sendRequest) times out. */
     void setTimeoutCallback(TimeoutCallback cb) { onTimeout_ = std::move(cb); }
+    /** Called for an inbound answer that matches no pending transaction. */
+    void setUnmatchedAnswerCallback(UnmatchedAnswerCallback cb) { onUnmatchedAnswer_ = std::move(cb); }
 
     /**
      * Send a server-initiated Diameter request through the given peer and
@@ -137,10 +148,23 @@ class DiameterServer {
      * @param onResponse Called when the correlated answer arrives.
      * @param timeoutMs  Timeout in milliseconds (0 = no timeout).
      * @param additionalLabels Extra metric labels reused for the correlated answer.
+     * @param onTimeout  Optional: called (once) if the transaction expires.
      * @return hop-by-hop ID used, or 0 if the send failed (e.g. null peer).
      */
     uint32_t sendRequest(std::shared_ptr<Peer> peer, Peer::Buffer request, ResponseCallback onResponse,
-                         uint32_t timeoutMs = 5000, const ert::metrics::labels_t &additionalLabels = {});
+                         uint32_t timeoutMs = 5000, const ert::metrics::labels_t &additionalLabels = {},
+                         TransactionTimeoutCallback onTimeout = {});
+
+    /**
+     * Try to correlate an answer received on ANOTHER leg with a pending
+     * server-initiated transaction: hop-by-hop, then end-to-end; the command
+     * code must match. On success the entry is removed, its timer cancelled,
+     * metrics updated (plus diameter_server_answers_recovered_counter) and the
+     * response callback invoked.
+     *
+     * @return true if the answer was resolved by this server.
+     */
+    bool tryResolve(const Peer::Buffer &answer);
 
     /**
      * Send a Diameter answer through the given peer, incrementing metrics.
@@ -169,6 +193,8 @@ class DiameterServer {
    private:
     void doAccept();
     void onPeerStateChange(std::shared_ptr<Peer> peer, Peer::State state);
+    void onPeerMessage(std::shared_ptr<Peer> peer, Peer::Buffer &&msg);
+    bool resolve(const Peer::Buffer &answer, bool crossLeg);
 
     // Build the server metric label set: base {source, command_code,
     // application_id} plus result_code (answers only) and any configured extra
@@ -180,6 +206,9 @@ class DiameterServer {
     // Pending server-initiated transaction (awaiting the correlated answer).
     struct PendingRequest {
         ResponseCallback callback;
+        TransactionTimeoutCallback onTimeout;
+        uint32_t endToEnd{0};
+        uint32_t commandCode{0};
         boost::asio::steady_timer timer;
         std::chrono::steady_clock::time_point sentAt;
         ert::metrics::labels_t additionalLabels;
@@ -198,11 +227,14 @@ class DiameterServer {
     RequestCallback onRequest_;
     PeerEventCallback onPeerEvent_;
     TimeoutCallback onTimeout_;
+    UnmatchedAnswerCallback onUnmatchedAnswer_;
     bool listening_{false};
 
     // Correlation map for server-initiated requests: hop-by-hop -> pending.
     mutable std::mutex pendingMutex_;
     std::unordered_map<uint32_t, std::shared_ptr<PendingRequest>> pending_;
+    // Secondary index: end-to-end -> hop-by-hop (fallback correlation key).
+    std::unordered_map<uint32_t, uint32_t> pendingByE2e_;
 
     // --- Metrics members ---
     ert::metrics::Metrics *metrics_{};
@@ -215,6 +247,8 @@ class DiameterServer {
     // Bidirectional (RFC 6733): server-initiated requests and their answers.
     ert::metrics::counter_family_t *requests_sent_counter_family_ptr_{};
     ert::metrics::counter_family_t *answers_received_counter_family_ptr_{};
+    ert::metrics::counter_family_t *answers_uncorrelated_counter_family_ptr_{};
+    ert::metrics::counter_family_t *answers_recovered_counter_family_ptr_{};
 };
 
 }  // namespace diametercomm

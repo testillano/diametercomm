@@ -88,6 +88,20 @@ class DiameterServer_test : public ::testing::Test {
     static uint32_t extractHopByHop(const Peer::Buffer& msg) {
         return (uint32_t(msg[12]) << 24) | (uint32_t(msg[13]) << 16) | (uint32_t(msg[14]) << 8) | uint32_t(msg[15]);
     }
+    // Answer for a received request: R-bit clear, same header (command, app,
+    // e2e), hop-by-hop replaced by 'hbhOverride' when non-zero (relay rewrite).
+    static Peer::Buffer answerFor(const Peer::Buffer& req, uint32_t hbhOverride = 0) {
+        Peer::Buffer msg(req.begin(), req.begin() + 20);
+        msg[3] = 20;
+        msg[4] = 0x00;
+        if (hbhOverride != 0) {
+            msg[12] = static_cast<uint8_t>(hbhOverride >> 24);
+            msg[13] = static_cast<uint8_t>(hbhOverride >> 16);
+            msg[14] = static_cast<uint8_t>(hbhOverride >> 8);
+            msg[15] = static_cast<uint8_t>(hbhOverride);
+        }
+        return msg;
+    }
 };
 
 TEST_F(DiameterServer_test, ListenAndAcceptSinglePeer) {
@@ -332,5 +346,127 @@ TEST_F(DiameterServer_test, ListenAndAcceptSinglePeer_SCTP) {
     EXPECT_EQ(server.activePeerCount(), 1u);
 
     clientPeer->close();
+    server.close();
+}
+
+// =============================================================================
+// Answer correlation hardening on the server leg.
+// =============================================================================
+
+// Uncorrelated answer: offered to the unmatched callback, never delivered to
+// the request callback.
+TEST_F(DiameterServer_test, UncorrelatedAnswerOfferedThenDropped) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 13890);
+    std::atomic<bool> deliveredAsRequest{false};
+    std::atomic<int> unmatched{0};
+    server.setRequestCallback([&](std::shared_ptr<Peer>, Peer::Buffer&&) { deliveredAsRequest = true; });
+    server.setUnmatchedAnswerCallback([&](std::shared_ptr<Peer> p, const Peer::Buffer& a) {
+        EXPECT_TRUE(p != nullptr);
+        EXPECT_EQ(extractHopByHop(a), 0x5555u);
+        unmatched++;
+        return false;
+    });
+
+    auto client = std::make_shared<Peer>(io_, clientConfig());
+    client->setStateCallback([&](std::shared_ptr<Peer> p, Peer::State s) {
+        if (s == Peer::State::Open) p->send(buildRaa(0x5555));
+    });
+    client->connect("127.0.0.1", 13890);
+    runFor(std::chrono::milliseconds(500));
+
+    EXPECT_EQ(unmatched.load(), 1);
+    EXPECT_FALSE(deliveredAsRequest);
+    EXPECT_EQ(server.activePeerCount(), 1u);
+
+    server.close();
+}
+
+// Server-initiated request answered with a rewritten hop-by-hop: correlated
+// by end-to-end; per-transaction timeout not fired.
+TEST_F(DiameterServer_test, ServerAnswerCorrelatedByEndToEnd) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 13891);
+
+    auto client = std::make_shared<Peer>(io_, clientConfig());
+    client->setRequestCallback(
+        [&](std::shared_ptr<Peer> p, Peer::Buffer&& msg) { p->send(answerFor(msg, extractHopByHop(msg) + 77)); });
+
+    std::atomic<bool> gotAnswer{false};
+    std::atomic<bool> timedOut{false};
+    server.setPeerEventCallback([&](std::shared_ptr<Peer> peer, Peer::State s) {
+        if (s == Peer::State::Open) {
+            server.sendRequest(
+                peer, buildRar(0), [&](const Peer::Buffer&) { gotAnswer = true; }, 300, {},
+                [&](uint32_t) { timedOut = true; });
+        }
+    });
+
+    client->connect("127.0.0.1", 13891);
+    runFor(std::chrono::milliseconds(700));
+
+    EXPECT_TRUE(gotAnswer);
+    EXPECT_FALSE(timedOut);
+
+    server.close();
+}
+
+// Per-transaction timeout callback carries the hop-by-hop returned by
+// sendRequest, and fires exactly once.
+TEST_F(DiameterServer_test, ServerPerTransactionTimeoutCallback) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 13892);
+    auto client = std::make_shared<Peer>(io_, clientConfig());
+    client->setRequestCallback([](std::shared_ptr<Peer>, Peer::Buffer&&) {});
+
+    std::atomic<int> timeouts{0};
+    uint32_t sentHbh = 0;
+    uint32_t timedOutHbh = 0;
+    server.setPeerEventCallback([&](std::shared_ptr<Peer> peer, Peer::State s) {
+        if (s == Peer::State::Open) {
+            sentHbh = server.sendRequest(
+                peer, buildRar(0), [](const Peer::Buffer&) { FAIL() << "no answer expected"; }, 150, {},
+                [&](uint32_t hbh) {
+                    timedOutHbh = hbh;
+                    timeouts++;
+                });
+        }
+    });
+
+    client->connect("127.0.0.1", 13892);
+    runFor(std::chrono::milliseconds(600));
+
+    EXPECT_EQ(timeouts.load(), 1);
+    EXPECT_NE(sentHbh, 0u);
+    EXPECT_EQ(timedOutHbh, sentHbh);
+
+    server.close();
+}
+
+// tryResolve() on the server: resolves a pending server-initiated transaction
+// with an answer that arrived elsewhere, once; rejects requests.
+TEST_F(DiameterServer_test, ServerTryResolve) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 13893);
+    Peer::Buffer seen;
+    auto client = std::make_shared<Peer>(io_, clientConfig());
+    client->setRequestCallback([&](std::shared_ptr<Peer>, Peer::Buffer&& msg) { seen = msg; });
+
+    std::atomic<int> answers{0};
+    server.setPeerEventCallback([&](std::shared_ptr<Peer> peer, Peer::State s) {
+        if (s == Peer::State::Open) {
+            server.sendRequest(peer, buildRar(0), [&](const Peer::Buffer&) { answers++; }, 2000);
+        }
+    });
+
+    client->connect("127.0.0.1", 13893);
+    runFor(std::chrono::milliseconds(400));
+    ASSERT_GE(seen.size(), 20u);
+
+    EXPECT_FALSE(server.tryResolve(seen));  // request
+    EXPECT_TRUE(server.tryResolve(answerFor(seen)));
+    EXPECT_FALSE(server.tryResolve(answerFor(seen)));  // already resolved
+    EXPECT_EQ(answers.load(), 1);
+
     server.close();
 }

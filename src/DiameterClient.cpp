@@ -24,6 +24,17 @@ void setHopByHop(Peer::Buffer& msg, uint32_t hbh) {
     msg[15] = static_cast<uint8_t>(hbh);
 }
 
+uint32_t extractEndToEnd(const Peer::Buffer& msg) {
+    return (uint32_t(msg[16]) << 24) | (uint32_t(msg[17]) << 16) | (uint32_t(msg[18]) << 8) | uint32_t(msg[19]);
+}
+
+void setEndToEnd(Peer::Buffer& msg, uint32_t e2e) {
+    msg[16] = static_cast<uint8_t>(e2e >> 24);
+    msg[17] = static_cast<uint8_t>(e2e >> 16);
+    msg[18] = static_cast<uint8_t>(e2e >> 8);
+    msg[19] = static_cast<uint8_t>(e2e);
+}
+
 bool isRequest(const Peer::Buffer& msg) { return (msg[4] & 0x80) != 0; }
 
 uint32_t extractCommandCode(const Peer::Buffer& msg) {
@@ -107,6 +118,14 @@ void DiameterClient::enableMetrics(ert::metrics::Metrics* metrics, const std::st
         answers_sent_counter_family_ptr_ = &(metrics_->addCounterFamily(
             "diameter_client_answers_sent_counter", "Diameter client answers sent counter", familyLabels));
 
+        answers_uncorrelated_counter_family_ptr_ =
+            &(metrics_->addCounterFamily("diameter_client_answers_uncorrelated_counter",
+                                         "Diameter client answers dropped (no pending transaction)", familyLabels));
+
+        answers_recovered_counter_family_ptr_ = &(metrics_->addCounterFamily(
+            "diameter_client_answers_recovered_counter",
+            "Diameter client answers correlated by end-to-end and/or on another leg", familyLabels));
+
         peer_state_gauge_family_ptr_ = &(metrics_->addGaugeFamily(
             "diameter_client_peer_state_gauge", "Diameter client peer state (1=open, 0=closed)", familyLabels));
 
@@ -151,7 +170,7 @@ void DiameterClient::connect(const std::string& host, uint16_t port) {
 // send
 // ============================================================================
 uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs,
-                              const ert::metrics::labels_t& additionalLabels) {
+                              const ert::metrics::labels_t& additionalLabels, TransactionTimeoutCallback onTimeout) {
     if (!peer_ || peer_->state() != Peer::State::Open) {
         if (metrics_ && request.size() >= 20) {
             std::string commandCode = std::to_string(extractCommandCode(request));
@@ -173,16 +192,38 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
         hbh = peer_->nextHopByHop();
         setHopByHop(request, hbh);
     }
+    // Assign end-to-end here (Peer::send keeps a non-zero one) so it can be
+    // indexed as the fallback correlation key.
+    uint32_t e2e = extractEndToEnd(request);
+    if (e2e == 0) {
+        e2e = peer_->nextEndToEnd();
+        setEndToEnd(request, e2e);
+    }
 
     // Register pending request (cache send time + extra labels for the correlated answer)
     auto pending = std::make_shared<PendingRequest>(io_);
     pending->callback = std::move(onResponse);
+    pending->onTimeout = std::move(onTimeout);
+    pending->endToEnd = e2e;
+    pending->commandCode = extractCommandCode(request);
     pending->sentAt = std::chrono::steady_clock::now();
     pending->additionalLabels = additionalLabels;
 
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
+        // Caller-provided ids may collide with a pending transaction: the newest
+        // wins, and the index must not keep pointing at the replaced entry.
+        auto prev = pending_.find(hbh);
+        if (prev != pending_.end()) pendingByE2e_.erase(prev->second->endToEnd);
+        auto prevE2e = pendingByE2e_.find(e2e);
+        if (prevE2e != pendingByE2e_.end() && prevE2e->second != hbh) {
+            LOGWARNING(ert::tracing::Logger::warning(
+                ert::tracing::Logger::asString("Duplicate pending end-to-end 0x%08x (hbh 0x%08x replaces 0x%08x)", e2e,
+                                               hbh, prevE2e->second),
+                ERT_FILE_LOCATION));
+        }
         pending_[hbh] = pending;
+        pendingByE2e_[e2e] = hbh;
     }
 
     // Set timeout
@@ -196,6 +237,7 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
                 auto it = pending_.find(hbh);
                 if (it == pending_.end()) return;
                 req = it->second;
+                pendingByE2e_.erase(req->endToEnd);
                 pending_.erase(it);
             }
             if (metrics_) {
@@ -204,17 +246,104 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
                     .Increment();
             }
             if (onTimeout_) onTimeout_(hbh);
+            if (req->onTimeout) req->onTimeout(hbh);
         });
     }
 
-    // Send the request
-    peer_->send(std::move(request));
+    // Send the request. A refused write must not leave a pending entry behind
+    // (it would only expire later as a misleading timeout).
+    if (!peer_->send(std::move(request))) {
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            auto it = pending_.find(hbh);
+            if (it != pending_.end() && it->second == pending) {
+                pendingByE2e_.erase(e2e);
+                pending_.erase(it);
+            }
+        }
+        pending->timer.cancel();
+        if (metrics_) {
+            requests_unsent_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, additionalLabels))
+                .Increment();
+        }
+        return 0;
+    }
 
     if (metrics_) {
         requests_sent_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, additionalLabels)).Increment();
     }
 
     return hbh;
+}
+
+// ============================================================================
+// resolve / tryResolve - correlate an answer (hop-by-hop, then end-to-end)
+// ============================================================================
+bool DiameterClient::tryResolve(const Buffer& answer) {
+    if (answer.size() < 20 || isRequest(answer)) return false;
+    return resolve(answer, /*crossLeg*/ true);
+}
+
+bool DiameterClient::resolve(const Buffer& msg, bool crossLeg) {
+    uint32_t hbh = extractHopByHop(msg);
+    uint32_t e2e = extractEndToEnd(msg);
+    uint32_t cmd = extractCommandCode(msg);
+    std::shared_ptr<PendingRequest> req;
+    bool byE2e = false;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        auto it = pending_.find(hbh);
+        if (it == pending_.end() || it->second->commandCode != cmd) {
+            // Fallback: end-to-end (0 is never used as a key: unassigned).
+            it = pending_.end();
+            if (e2e != 0) {
+                auto itE = pendingByE2e_.find(e2e);
+                if (itE != pendingByE2e_.end()) {
+                    auto itH = pending_.find(itE->second);
+                    if (itH != pending_.end() && itH->second->commandCode == cmd) {
+                        it = itH;
+                        byE2e = true;
+                    }
+                }
+            }
+        }
+        if (it == pending_.end()) return false;
+        req = it->second;
+        pendingByE2e_.erase(req->endToEnd);
+        pending_.erase(it);
+    }
+    req->timer.cancel();
+
+    if (metrics_) {
+        std::string commandCode = std::to_string(cmd);
+        std::string applicationId = std::to_string(extractApplicationId(msg));
+        std::string resultCode = std::to_string(extractResultCode(msg));
+        answers_received_counter_family_ptr_
+            ->Add(clientLabels(commandCode, applicationId, req->additionalLabels, resultCode))
+            .Increment();
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - req->sentAt).count();
+        response_delay_seconds_histogram_family_ptr_
+            ->Add(clientLabels(commandCode, applicationId, req->additionalLabels),
+                  response_delay_seconds_histogram_bucket_boundaries_)
+            .Observe(sec);
+        if (byE2e || crossLeg) {
+            auto labels = clientLabels(commandCode, applicationId, {});
+            labels["by"] = byE2e ? "e2e" : "hbh";
+            labels["path"] = crossLeg ? "cross-leg" : "same-leg";
+            answers_recovered_counter_family_ptr_->Add(labels).Increment();
+        }
+    }
+
+    if (byE2e || crossLeg) {
+        LOGINFORMATIONAL(ert::tracing::Logger::informational(
+            ert::tracing::Logger::asString("Diameter client: answer correlated by %s (%s) hbh=0x%08x e2e=0x%08x cmd=%u",
+                                           byE2e ? "end-to-end" : "hop-by-hop", crossLeg ? "cross-leg" : "same-leg",
+                                           hbh, e2e, cmd),
+            ERT_FILE_LOCATION));
+    }
+
+    if (req->callback) req->callback(msg);
+    return true;
 }
 
 // ============================================================================
@@ -256,6 +385,7 @@ void DiameterClient::close() {
         req->timer.cancel();
     }
     pending_.clear();
+    pendingByE2e_.clear();
 }
 
 // ============================================================================
@@ -302,41 +432,26 @@ void DiameterClient::onPeerState(std::shared_ptr<Peer> /*peer*/, Peer::State sta
 void DiameterClient::onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg) {
     if (msg.size() < 20) return;
 
-    // If it's an answer (not request), correlate by hop-by-hop
+    // Answer (R-bit clear): correlate locally, then let the application try
+    // other legs. An answer is NEVER delivered as a request (that would make
+    // the application answer an answer).
     if (!isRequest(msg)) {
-        uint32_t hbh = extractHopByHop(msg);
-        std::shared_ptr<PendingRequest> req;
-        {
-            std::lock_guard<std::mutex> lock(pendingMutex_);
-            auto it = pending_.find(hbh);
-            if (it != pending_.end()) {
-                req = it->second;
-                pending_.erase(it);
-            }
-        }
+        if (resolve(msg, /*crossLeg*/ false)) return;
+        if (onUnmatchedAnswer_ && onUnmatchedAnswer_(msg)) return;
 
+        uint32_t cmd = extractCommandCode(msg);
+        uint32_t appId = extractApplicationId(msg);
+        LOGWARNING(ert::tracing::Logger::warning(
+            ert::tracing::Logger::asString("Diameter client: dropping uncorrelated answer from %s:%d cmd=%u app=%u "
+                                           "hbh=0x%08x e2e=0x%08x (late, unknown or already answered)",
+                                           host_.c_str(), port_, cmd, appId, extractHopByHop(msg),
+                                           extractEndToEnd(msg)),
+            ERT_FILE_LOCATION));
         if (metrics_) {
-            std::string commandCode = std::to_string(extractCommandCode(msg));
-            std::string applicationId = std::to_string(extractApplicationId(msg));
-            std::string resultCode = std::to_string(extractResultCode(msg));
-            ert::metrics::labels_t extra = req ? req->additionalLabels : ert::metrics::labels_t{};
-            answers_received_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, extra, resultCode))
+            answers_uncorrelated_counter_family_ptr_->Add(clientLabels(std::to_string(cmd), std::to_string(appId), {}))
                 .Increment();
-            // Round-trip latency: only for correlated answers (we know sentAt).
-            if (req) {
-                double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - req->sentAt).count();
-                response_delay_seconds_histogram_family_ptr_
-                    ->Add(clientLabels(commandCode, applicationId, extra),
-                          response_delay_seconds_histogram_bucket_boundaries_)
-                    .Observe(sec);
-            }
         }
-
-        if (req) {
-            req->timer.cancel();
-            if (req->callback) req->callback(msg);
-            return;
-        }
+        return;
     }
 
     // Unsolicited request from the server side

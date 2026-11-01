@@ -11,6 +11,7 @@ Licensed under the MIT License. Copyright (c) 2024 Eduardo Ramos
 
 #include <algorithm>
 #include <ert/diametercomm/DiameterServer.hpp>
+#include <ert/tracing/Logger.hpp>
 
 namespace ert {
 namespace diametercomm {
@@ -38,6 +39,18 @@ void setHopByHop(Peer::Buffer& msg, uint32_t hbh) {
     msg[13] = static_cast<uint8_t>(hbh >> 16);
     msg[14] = static_cast<uint8_t>(hbh >> 8);
     msg[15] = static_cast<uint8_t>(hbh);
+}
+
+uint32_t extractEndToEnd(const Peer::Buffer& msg) {
+    if (msg.size() < 20) return 0;
+    return (uint32_t(msg[16]) << 24) | (uint32_t(msg[17]) << 16) | (uint32_t(msg[18]) << 8) | uint32_t(msg[19]);
+}
+
+void setEndToEnd(Peer::Buffer& msg, uint32_t e2e) {
+    msg[16] = static_cast<uint8_t>(e2e >> 24);
+    msg[17] = static_cast<uint8_t>(e2e >> 16);
+    msg[18] = static_cast<uint8_t>(e2e >> 8);
+    msg[19] = static_cast<uint8_t>(e2e);
 }
 
 bool isRequest(const Peer::Buffer& msg) { return msg.size() >= 20 && (msg[4] & 0x80) != 0; }
@@ -111,6 +124,14 @@ void DiameterServer::enableMetrics(ert::metrics::Metrics* metrics, const std::st
 
         answers_received_counter_family_ptr_ = &(metrics_->addCounterFamily(
             "diameter_server_answers_received_counter", "Diameter server answers received counter", familyLabels));
+
+        answers_uncorrelated_counter_family_ptr_ =
+            &(metrics_->addCounterFamily("diameter_server_answers_uncorrelated_counter",
+                                         "Diameter server answers dropped (no pending transaction)", familyLabels));
+
+        answers_recovered_counter_family_ptr_ = &(metrics_->addCounterFamily(
+            "diameter_server_answers_recovered_counter",
+            "Diameter server answers correlated by end-to-end and/or on another leg", familyLabels));
     }
 }
 
@@ -234,27 +255,49 @@ ert::metrics::labels_t DiameterServer::serverLabels(const std::string& commandCo
 }
 
 uint32_t DiameterServer::sendRequest(std::shared_ptr<Peer> peer, Peer::Buffer request, ResponseCallback onResponse,
-                                     uint32_t timeoutMs, const ert::metrics::labels_t& additionalLabels) {
+                                     uint32_t timeoutMs, const ert::metrics::labels_t& additionalLabels,
+                                     TransactionTimeoutCallback onTimeout) {
     if (!peer || request.size() < 20) return 0;
 
     std::string commandCode = std::to_string(extractCommandCode(request));
     std::string applicationId = std::to_string(extractApplicationId(request));
 
-    // Assign hop-by-hop if the caller left it at 0.
+    // Assign hop-by-hop / end-to-end if the caller left them at 0 (end-to-end
+    // is indexed as the fallback correlation key).
     uint32_t hbh = extractHopByHop(request);
     if (hbh == 0) {
         hbh = peer->nextHopByHop();
         setHopByHop(request, hbh);
     }
+    uint32_t e2e = extractEndToEnd(request);
+    if (e2e == 0) {
+        e2e = peer->nextEndToEnd();
+        setEndToEnd(request, e2e);
+    }
 
     // Register the pending transaction (send time + labels reused for the answer).
     auto pending = std::make_shared<PendingRequest>(io_);
     pending->callback = std::move(onResponse);
+    pending->onTimeout = std::move(onTimeout);
+    pending->endToEnd = e2e;
+    pending->commandCode = extractCommandCode(request);
     pending->sentAt = std::chrono::steady_clock::now();
     pending->additionalLabels = additionalLabels;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
+        // Caller-provided ids may collide with a pending transaction: the newest
+        // wins, and the index must not keep pointing at the replaced entry.
+        auto prev = pending_.find(hbh);
+        if (prev != pending_.end()) pendingByE2e_.erase(prev->second->endToEnd);
+        auto prevE2e = pendingByE2e_.find(e2e);
+        if (prevE2e != pendingByE2e_.end() && prevE2e->second != hbh) {
+            LOGWARNING(ert::tracing::Logger::warning(
+                ert::tracing::Logger::asString("Duplicate pending end-to-end 0x%08x (hbh 0x%08x replaces 0x%08x)", e2e,
+                                               hbh, prevE2e->second),
+                ERT_FILE_LOCATION));
+        }
         pending_[hbh] = pending;
+        pendingByE2e_[e2e] = hbh;
     }
 
     // Arm the timeout.
@@ -268,20 +311,25 @@ uint32_t DiameterServer::sendRequest(std::shared_ptr<Peer> peer, Peer::Buffer re
                 auto it = pending_.find(hbh);
                 if (it == pending_.end()) return;
                 req = it->second;
+                pendingByE2e_.erase(req->endToEnd);
                 pending_.erase(it);
             }
             if (onTimeout_) onTimeout_(hbh);
+            if (req->onTimeout) req->onTimeout(hbh);
         });
     }
 
     if (!peer->send(std::move(request))) {
         // Send failed: drop the pending transaction.
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        auto it = pending_.find(hbh);
-        if (it != pending_.end()) {
-            it->second->timer.cancel();
-            pending_.erase(it);
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            auto it = pending_.find(hbh);
+            if (it != pending_.end() && it->second == pending) {
+                pendingByE2e_.erase(e2e);
+                pending_.erase(it);
+            }
         }
+        pending->timer.cancel();
         return 0;
     }
 
@@ -290,6 +338,100 @@ uint32_t DiameterServer::sendRequest(std::shared_ptr<Peer> peer, Peer::Buffer re
     }
 
     return hbh;
+}
+
+bool DiameterServer::tryResolve(const Peer::Buffer& answer) {
+    if (answer.size() < 20 || isRequest(answer)) return false;
+    return resolve(answer, /*crossLeg*/ true);
+}
+
+bool DiameterServer::resolve(const Peer::Buffer& msg, bool crossLeg) {
+    uint32_t hbh = extractHopByHop(msg);
+    uint32_t e2e = extractEndToEnd(msg);
+    uint32_t cmd = extractCommandCode(msg);
+    std::shared_ptr<PendingRequest> req;
+    bool byE2e = false;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        auto it = pending_.find(hbh);
+        if (it == pending_.end() || it->second->commandCode != cmd) {
+            // Fallback: end-to-end (0 is never used as a key: unassigned).
+            it = pending_.end();
+            if (e2e != 0) {
+                auto itE = pendingByE2e_.find(e2e);
+                if (itE != pendingByE2e_.end()) {
+                    auto itH = pending_.find(itE->second);
+                    if (itH != pending_.end() && itH->second->commandCode == cmd) {
+                        it = itH;
+                        byE2e = true;
+                    }
+                }
+            }
+        }
+        if (it == pending_.end()) return false;
+        req = it->second;
+        pendingByE2e_.erase(req->endToEnd);
+        pending_.erase(it);
+    }
+    req->timer.cancel();
+
+    if (metrics_) {
+        std::string commandCode = std::to_string(cmd);
+        std::string applicationId = std::to_string(extractApplicationId(msg));
+        std::string resultCode = std::to_string(extractResultCode(msg));
+        answers_received_counter_family_ptr_
+            ->Add(serverLabels(commandCode, applicationId, req->additionalLabels, resultCode))
+            .Increment();
+        if (byE2e || crossLeg) {
+            auto labels = serverLabels(commandCode, applicationId, {});
+            labels["by"] = byE2e ? "e2e" : "hbh";
+            labels["path"] = crossLeg ? "cross-leg" : "same-leg";
+            answers_recovered_counter_family_ptr_->Add(labels).Increment();
+        }
+    }
+
+    if (byE2e || crossLeg) {
+        LOGINFORMATIONAL(ert::tracing::Logger::informational(
+            ert::tracing::Logger::asString("Diameter server: answer correlated by %s (%s) hbh=0x%08x e2e=0x%08x cmd=%u",
+                                           byE2e ? "end-to-end" : "hop-by-hop", crossLeg ? "cross-leg" : "same-leg",
+                                           hbh, e2e, cmd),
+            ERT_FILE_LOCATION));
+    }
+
+    if (req->callback) req->callback(msg);
+    return true;
+}
+
+void DiameterServer::onPeerMessage(std::shared_ptr<Peer> peer, Peer::Buffer&& msg) {
+    // Bidirectional (RFC 6733): an inbound ANSWER (R-bit clear) is the
+    // correlated reply to a server-initiated request. Correlate it locally,
+    // then let the application try other legs; never deliver it as a request.
+    if (!isRequest(msg)) {
+        if (resolve(msg, /*crossLeg*/ false)) return;
+        if (onUnmatchedAnswer_ && onUnmatchedAnswer_(peer, msg)) return;
+
+        uint32_t cmd = extractCommandCode(msg);
+        uint32_t appId = extractApplicationId(msg);
+        LOGWARNING(ert::tracing::Logger::warning(
+            ert::tracing::Logger::asString("Diameter server: dropping uncorrelated answer from peer '%s' cmd=%u "
+                                           "app=%u hbh=0x%08x e2e=0x%08x (late, unknown or already answered)",
+                                           peer ? peer->remoteOriginHost().c_str() : "?", cmd, appId,
+                                           extractHopByHop(msg), extractEndToEnd(msg)),
+            ERT_FILE_LOCATION));
+        if (metrics_) {
+            answers_uncorrelated_counter_family_ptr_->Add(serverLabels(std::to_string(cmd), std::to_string(appId), {}))
+                .Increment();
+        }
+        return;
+    }
+
+    if (metrics_) {
+        std::string commandCode = std::to_string(extractCommandCode(msg));
+        auto& counter =
+            requests_received_counter_family_ptr_->Add({{"source", source_}, {"command_code", commandCode}});
+        counter.Increment();
+    }
+    if (onRequest_) onRequest_(std::move(peer), std::move(msg));
 }
 
 void DiameterServer::doAccept() {
@@ -307,47 +449,8 @@ void DiameterServer::doAccept() {
         auto startPeer = [this](std::shared_ptr<PeerConnection> conn) {
             auto peer = std::make_shared<Peer>(conn, io_, config_);
 
-            peer->setRequestCallback([this](std::shared_ptr<Peer> p, Peer::Buffer&& msg) {
-                // Bidirectional (RFC 6733): an inbound ANSWER (R-bit clear) is
-                // the correlated reply to a server-initiated request. Route it
-                // to the pending map instead of treating it as a request.
-                if (!isRequest(msg)) {
-                    uint32_t hbh = extractHopByHop(msg);
-                    std::shared_ptr<PendingRequest> req;
-                    {
-                        std::lock_guard<std::mutex> lock(pendingMutex_);
-                        auto it = pending_.find(hbh);
-                        if (it != pending_.end()) {
-                            req = it->second;
-                            pending_.erase(it);
-                        }
-                    }
-                    if (req) {
-                        if (metrics_) {
-                            std::string commandCode = std::to_string(extractCommandCode(msg));
-                            std::string applicationId = std::to_string(extractApplicationId(msg));
-                            std::string resultCode = std::to_string(extractResultCode(msg));
-                            answers_received_counter_family_ptr_
-                                ->Add(serverLabels(commandCode, applicationId, req->additionalLabels, resultCode))
-                                .Increment();
-                        }
-                        req->timer.cancel();
-                        if (req->callback) req->callback(msg);
-                        return;
-                    }
-                    // Uncorrelated answer: no pending transaction matches. Drop
-                    // it (do not count as a received request nor deliver as one).
-                    return;
-                }
-
-                if (metrics_) {
-                    std::string commandCode = std::to_string(extractCommandCode(msg));
-                    auto& counter = requests_received_counter_family_ptr_->Add(
-                        {{"source", source_}, {"command_code", commandCode}});
-                    counter.Increment();
-                }
-                if (onRequest_) onRequest_(std::move(p), std::move(msg));
-            });
+            peer->setRequestCallback(
+                [this](std::shared_ptr<Peer> p, Peer::Buffer&& msg) { onPeerMessage(std::move(p), std::move(msg)); });
 
             peer->setStateCallback(
                 [this](std::shared_ptr<Peer> p, Peer::State state) { onPeerStateChange(std::move(p), state); });
