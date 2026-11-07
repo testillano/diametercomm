@@ -46,6 +46,9 @@ add_compile_options(
   $<$<CONFIG:Debug>:-O0>
   $<$<CONFIG:Debug>:-g3>
   $<$<CONFIG:Debug>:--coverage>
+  # Atomic gcov counters: the stress tests run handlers on many io threads, and
+  # racy counter updates produce negative counts that make geninfo fail.
+  $<$<CONFIG:Debug>:-fprofile-update=atomic>
 )
 link_libraries(
   $<$<CONFIG:Debug>:--coverage>
