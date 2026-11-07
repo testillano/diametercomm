@@ -21,10 +21,15 @@ namespace diametercomm {
 // Construction / Destruction
 // ============================================================================
 
+// Every socket operation and handler of a connection runs on its strand: the
+// io_context may run on many threads and writes are requested from foreign
+// threads (e.g. the gateway HTTP/2 thread). Without it, overlapping
+// async_write interleave bytes on the wire (TCP) or corrupt the TLS engine.
 PeerConnection::PeerConnection(boost::asio::ip::tcp::socket socket, Transport transport)
-    : socket_(std::move(socket)), transport_(transport) {}
+    : socket_(std::move(socket)), strand_(boost::asio::make_strand(socket_.get_executor())), transport_(transport) {}
 
-PeerConnection::PeerConnection(boost::asio::io_context& io, Transport transport) : socket_(io), transport_(transport) {}
+PeerConnection::PeerConnection(boost::asio::io_context& io, Transport transport)
+    : socket_(io), strand_(boost::asio::make_strand(socket_.get_executor())), transport_(transport) {}
 
 PeerConnection::~PeerConnection() { close(); }
 
@@ -86,14 +91,17 @@ void PeerConnection::asyncHandshakeServer(std::function<void()> onDone, ErrorCal
         return;
     }
     auto self = shared_from_this();
-    sslStream_->async_handshake(boost::asio::ssl::stream_base::server,
-                                [self, onDone, onError](const boost::system::error_code& ec) {
-                                    if (ec) {
-                                        if (onError) onError(ec);
-                                        return;
-                                    }
-                                    if (onDone) onDone();
-                                });
+    boost::asio::post(strand_, [self, onDone, onError]() {
+        self->sslStream_->async_handshake(
+            boost::asio::ssl::stream_base::server,
+            boost::asio::bind_executor(self->strand_, [self, onDone, onError](const boost::system::error_code& ec) {
+                if (ec) {
+                    if (onError) onError(ec);
+                    return;
+                }
+                if (onDone) onDone();
+            }));
+    });
 }
 
 // ============================================================================
@@ -159,152 +167,170 @@ void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::f
     auto self = shared_from_this();
     resolver->async_resolve(
         host, std::to_string(port),
-        [self, resolver, onConnected, onError, localAddress](const boost::system::error_code& ec,
-                                                             boost::asio::ip::tcp::resolver::results_type results) {
-            if (ec) {
-                if (onError) onError(ec);
-                return;
-            }
-
-            if (self->transport_ == Transport::SCTP) {
-                // For SCTP: create native socket and assign to tcp::socket
-                auto it = results.begin();
-                if (it == results.end()) {
-                    if (onError) onError(boost::asio::error::host_not_found);
-                    return;
-                }
-                int family = it->endpoint().address().is_v6() ? AF_INET6 : AF_INET;
-                bool isV6 = (family == AF_INET6);
-                int fd = ::socket(family, SOCK_STREAM, IPPROTO_SCTP);
-                if (fd < 0) {
-                    if (onError)
-                        onError(boost::system::errc::make_error_code(boost::system::errc::protocol_not_supported));
-                    return;
-                }
-                boost::system::error_code assign_ec;
-                auto proto = isV6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4();
-                self->socket_.assign(proto, fd, assign_ec);
-                if (assign_ec) {
-                    ::close(fd);
-                    if (onError) onError(assign_ec);
+        boost::asio::bind_executor(
+            strand_, [self, resolver, onConnected, onError, localAddress](
+                         const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::results_type results) {
+                if (ec) {
+                    if (onError) onError(ec);
                     return;
                 }
 
-                // SCTP single-homing: bind the socket to ONE local source
-                // address before connecting, so the INIT advertises only that
-                // address (not every local interface). See deriveSourceAddress()
-                // above for the full rationale (SCTP multihoming would otherwise
-                // advertise non-routable addresses like docker0 and stall the
-                // handshake in COOKIE_WAIT).
-                //
-                // Address selection:
-                //   - localAddress NON-EMPTY  -> explicit override: bind exactly
-                //     to it. Use this to PIN the egress interface when the kernel
-                //     route would pick a path the peer does not accept (asymmetric
-                //     routing, or a VIP reachable only via a specific interface).
-                //     The caller is responsible for providing an address the peer
-                //     can actually reach (and that the host can egress from).
-                //   - localAddress EMPTY (default) -> auto-derive the egress source
-                //     toward the peer (deriveSourceAddress). This is the kernel's
-                //     own route decision, so the advertised address matches where
-                //     the traffic actually leaves from.
-                //   - derivation fails -> leave the socket unbound (legacy
-                //     behavior); better to try than to abort the connect.
-                //
-                // A failed bind (e.g. the given address is not local) is surfaced
-                // via onError rather than silently ignored.
-                {
-                    std::string local = localAddress;
-                    bool explicitPin = !local.empty();
-                    if (local.empty()) local = PeerConnection::deriveSourceAddress(it->endpoint().address());
-                    if (!local.empty()) {
-                        boost::system::error_code addr_ec;
-                        auto laddr = boost::asio::ip::make_address(local, addr_ec);
-                        if (!addr_ec) {
-                            boost::system::error_code bind_ec;
-                            self->socket_.bind(boost::asio::ip::tcp::endpoint(laddr, 0), bind_ec);
-                            if (bind_ec) {
-                                if (onError) onError(bind_ec);
-                                return;
+                if (self->transport_ == Transport::SCTP) {
+                    // For SCTP: create native socket and assign to tcp::socket
+                    auto it = results.begin();
+                    if (it == results.end()) {
+                        if (onError) onError(boost::asio::error::host_not_found);
+                        return;
+                    }
+                    int family = it->endpoint().address().is_v6() ? AF_INET6 : AF_INET;
+                    bool isV6 = (family == AF_INET6);
+                    int fd = ::socket(family, SOCK_STREAM, IPPROTO_SCTP);
+                    if (fd < 0) {
+                        if (onError)
+                            onError(boost::system::errc::make_error_code(boost::system::errc::protocol_not_supported));
+                        return;
+                    }
+                    boost::system::error_code assign_ec;
+                    auto proto = isV6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4();
+                    self->socket_.assign(proto, fd, assign_ec);
+                    if (assign_ec) {
+                        ::close(fd);
+                        if (onError) onError(assign_ec);
+                        return;
+                    }
+
+                    // SCTP single-homing: bind the socket to ONE local source
+                    // address before connecting, so the INIT advertises only that
+                    // address (not every local interface). See deriveSourceAddress()
+                    // above for the full rationale (SCTP multihoming would otherwise
+                    // advertise non-routable addresses like docker0 and stall the
+                    // handshake in COOKIE_WAIT).
+                    //
+                    // Address selection:
+                    //   - localAddress NON-EMPTY  -> explicit override: bind exactly
+                    //     to it. Use this to PIN the egress interface when the kernel
+                    //     route would pick a path the peer does not accept (asymmetric
+                    //     routing, or a VIP reachable only via a specific interface).
+                    //     The caller is responsible for providing an address the peer
+                    //     can actually reach (and that the host can egress from).
+                    //   - localAddress EMPTY (default) -> auto-derive the egress source
+                    //     toward the peer (deriveSourceAddress). This is the kernel's
+                    //     own route decision, so the advertised address matches where
+                    //     the traffic actually leaves from.
+                    //   - derivation fails -> leave the socket unbound (legacy
+                    //     behavior); better to try than to abort the connect.
+                    //
+                    // A failed bind (e.g. the given address is not local) is surfaced
+                    // via onError rather than silently ignored.
+                    {
+                        std::string local = localAddress;
+                        bool explicitPin = !local.empty();
+                        if (local.empty()) local = PeerConnection::deriveSourceAddress(it->endpoint().address());
+                        if (!local.empty()) {
+                            boost::system::error_code addr_ec;
+                            auto laddr = boost::asio::ip::make_address(local, addr_ec);
+                            if (!addr_ec) {
+                                boost::system::error_code bind_ec;
+                                self->socket_.bind(boost::asio::ip::tcp::endpoint(laddr, 0), bind_ec);
+                                if (bind_ec) {
+                                    if (onError) onError(bind_ec);
+                                    return;
+                                }
+                                // Startup visibility: report the single local source address the
+                                // SCTP INIT will advertise, and whether it was pinned explicitly
+                                // (--diameter-client-local-host / Config::localAddress) or
+                                // auto-derived from the route toward the peer.
+                                LOGWARNING(ert::tracing::Logger::warning(
+                                    ert::tracing::Logger::asString(
+                                        "SCTP client source address (advertised in INIT): %s [%s]", local.c_str(),
+                                        explicitPin ? "explicit" : "auto-derived"),
+                                    ERT_FILE_LOCATION));
+                            } else if (explicitPin) {
+                                // An explicit address that does not parse is a config error worth flagging.
+                                LOGWARNING(ert::tracing::Logger::warning(
+                                    ert::tracing::Logger::asString(
+                                        "SCTP client local address '%s' is not a valid IP; leaving socket unbound",
+                                        local.c_str()),
+                                    ERT_FILE_LOCATION));
                             }
-                            // Startup visibility: report the single local source address the
-                            // SCTP INIT will advertise, and whether it was pinned explicitly
-                            // (--diameter-client-local-host / Config::localAddress) or
-                            // auto-derived from the route toward the peer.
+                        } else {
+                            // Could not determine a source address: unbound (legacy multihomed INIT).
                             LOGWARNING(ert::tracing::Logger::warning(
-                                ert::tracing::Logger::asString(
-                                    "SCTP client source address (advertised in INIT): %s [%s]", local.c_str(),
-                                    explicitPin ? "explicit" : "auto-derived"),
-                                ERT_FILE_LOCATION));
-                        } else if (explicitPin) {
-                            // An explicit address that does not parse is a config error worth flagging.
-                            LOGWARNING(ert::tracing::Logger::warning(
-                                ert::tracing::Logger::asString(
-                                    "SCTP client local address '%s' is not a valid IP; leaving socket unbound",
-                                    local.c_str()),
+                                "SCTP client source address could not be derived; socket left unbound "
+                                "(INIT will advertise all local addresses)",
                                 ERT_FILE_LOCATION));
                         }
-                    } else {
-                        // Could not determine a source address: unbound (legacy multihomed INIT).
-                        LOGWARNING(ert::tracing::Logger::warning(
-                            "SCTP client source address could not be derived; socket left unbound "
-                            "(INIT will advertise all local addresses)",
-                            ERT_FILE_LOCATION));
                     }
+
+                    // Single-homing: connect the assigned SCTP socket to the single
+                    // resolved endpoint via the member async_connect. We must NOT use
+                    // the range free-function async_connect here: it closes/reopens
+                    // the socket for each candidate endpoint (reopening as TCP via
+                    // endpoint.protocol()), which would silently discard our SCTP fd.
+                    boost::asio::ip::tcp::endpoint endpoint = it->endpoint();
+                    auto onSctpConnect = [self, onConnected, onError](const boost::system::error_code& ec2) {
+                        if (ec2) {
+                            if (onError) onError(ec2);
+                            return;
+                        }
+                        if (onConnected) onConnected();
+                    };
+                    self->socket_.async_connect(endpoint,
+                                                boost::asio::bind_executor(self->strand_, std::move(onSctpConnect)));
+                    return;
                 }
 
-                // Single-homing: connect the assigned SCTP socket to the single
-                // resolved endpoint via the member async_connect. We must NOT use
-                // the range free-function async_connect here: it closes/reopens
-                // the socket for each candidate endpoint (reopening as TCP via
-                // endpoint.protocol()), which would silently discard our SCTP fd.
-                boost::asio::ip::tcp::endpoint endpoint = it->endpoint();
-                self->socket_.async_connect(endpoint,
-                                            [self, onConnected, onError](const boost::system::error_code& ec2) {
-                                                if (ec2) {
-                                                    if (onError) onError(ec2);
-                                                    return;
-                                                }
-                                                if (onConnected) onConnected();
-                                            });
-                return;
-            }
-
-            // TCP: standard range connect (tries each resolved endpoint in turn).
-            boost::asio::async_connect(self->socket_, results,
-                                       [self, onConnected, onError](const boost::system::error_code& ec2,
+                // TCP: standard range connect (tries each resolved endpoint in turn).
+                boost::asio::async_connect(
+                    self->socket_, results,
+                    boost::asio::bind_executor(
+                        self->strand_, [self, onConnected, onError](const boost::system::error_code& ec2,
                                                                     const boost::asio::ip::tcp::endpoint&) {
-                                           if (ec2) {
-                                               if (onError) onError(ec2);
-                                               return;
-                                           }
-                                           // Disable Nagle for TCP
-                                           self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
-                                           if (self->tls_) {
-                                               // TLS/TCP: perform client handshake before signalling connected.
-                                               self->sslStream_->async_handshake(
-                                                   boost::asio::ssl::stream_base::client,
-                                                   [self, onConnected, onError](const boost::system::error_code& hec) {
-                                                       if (hec) {
-                                                           if (onError) onError(hec);
-                                                           return;
-                                                       }
-                                                       if (onConnected) onConnected();
-                                                   });
-                                           } else {
-                                               if (onConnected) onConnected();
-                                           }
-                                       });
-        });
+                            if (ec2) {
+                                if (onError) onError(ec2);
+                                return;
+                            }
+                            // Disable Nagle for TCP
+                            self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
+                            if (self->tls_) {
+                                // TLS/TCP: perform client handshake before signalling connected.
+                                auto onHandshake = [self, onConnected, onError](const boost::system::error_code& hec) {
+                                    if (hec) {
+                                        if (onError) onError(hec);
+                                        return;
+                                    }
+                                    if (onConnected) onConnected();
+                                };
+                                self->sslStream_->async_handshake(
+                                    boost::asio::ssl::stream_base::client,
+                                    boost::asio::bind_executor(self->strand_, std::move(onHandshake)));
+                            } else {
+                                if (onConnected) onConnected();
+                            }
+                        }));
+            }));
 }
 
 // ============================================================================
 // startReading
 // ============================================================================
 void PeerConnection::startReading(MessageCallback onMessage, ErrorCallback onError) {
-    onMessage_ = std::move(onMessage);
-    onError_ = std::move(onError);
-    doReadHeader();
+    auto self = shared_from_this();
+    boost::asio::post(strand_, [self, onMessage = std::move(onMessage), onError = std::move(onError)]() mutable {
+        self->onMessage_ = std::move(onMessage);
+        self->onError_ = std::move(onError);
+        self->doReadHeader();
+    });
+}
+
+// ============================================================================
+// reportError (strand only): first error wins, pending writes are dropped
+// ============================================================================
+void PeerConnection::reportError(const boost::system::error_code& ec) {
+    if (errorReported_) return;
+    errorReported_ = true;
+    writeQueue_.clear();
+    if (onError_) onError_(ec);
 }
 
 // ============================================================================
@@ -312,9 +338,9 @@ void PeerConnection::startReading(MessageCallback onMessage, ErrorCallback onErr
 // ============================================================================
 void PeerConnection::doReadHeader() {
     auto self = shared_from_this();
-    auto handler = [self](const boost::system::error_code& ec, std::size_t) {
+    auto handler = boost::asio::bind_executor(strand_, [self](const boost::system::error_code& ec, std::size_t) {
         if (ec) {
-            if (self->onError_) self->onError_(ec);
+            self->reportError(ec);
             return;
         }
 
@@ -322,13 +348,12 @@ void PeerConnection::doReadHeader() {
                           uint32_t(self->headerBuf_[3]);
 
         if (msgLen < 20 || msgLen > 16777215) {
-            auto err = boost::system::errc::make_error_code(boost::system::errc::message_size);
-            if (self->onError_) self->onError_(err);
+            self->reportError(boost::system::errc::make_error_code(boost::system::errc::message_size));
             return;
         }
 
         self->doReadBody(msgLen);
-    };
+    });
     if (tls_) {
         boost::asio::async_read(*sslStream_, boost::asio::buffer(headerBuf_), std::move(handler));
     } else {
@@ -351,9 +376,9 @@ void PeerConnection::doReadBody(uint32_t msgLen) {
     }
 
     auto self = shared_from_this();
-    auto handler = [self](const boost::system::error_code& ec, std::size_t) {
+    auto handler = boost::asio::bind_executor(strand_, [self](const boost::system::error_code& ec, std::size_t) {
         if (ec) {
-            if (self->onError_) self->onError_(ec);
+            self->reportError(ec);
             return;
         }
 
@@ -362,7 +387,7 @@ void PeerConnection::doReadBody(uint32_t msgLen) {
         }
 
         self->doReadHeader();
-    };
+    });
     if (tls_) {
         boost::asio::async_read(*sslStream_, boost::asio::buffer(readBuf_.data() + 4, remaining), std::move(handler));
     } else {
@@ -374,16 +399,38 @@ void PeerConnection::doReadBody(uint32_t msgLen) {
 // asyncWrite
 // ============================================================================
 void PeerConnection::asyncWrite(Buffer msg, std::function<void()> onComplete) {
+    if (closed_) return;
     auto self = shared_from_this();
-    auto msgPtr = std::make_shared<Buffer>(std::move(msg));
+    PendingWrite pending{std::make_shared<Buffer>(std::move(msg)), std::move(onComplete)};
+    boost::asio::post(strand_, [self, pending = std::move(pending)]() mutable {
+        if (self->closed_ || self->errorReported_) return;
+        self->writeQueue_.push_back(std::move(pending));
+        if (!self->writing_) self->doWrite();
+    });
+}
 
-    auto handler = [self, msgPtr, onComplete](const boost::system::error_code& ec, std::size_t) {
+// ============================================================================
+// doWrite (strand only): write the queue head; the next one starts when it
+// completes, so there is never more than one async_write on the socket.
+// ============================================================================
+void PeerConnection::doWrite() {
+    writing_ = true;
+    auto self = shared_from_this();
+    auto msgPtr = writeQueue_.front().msg;  // keeps the buffer alive until completion
+
+    auto onWritten = [self, msgPtr](const boost::system::error_code& ec, std::size_t) {
+        self->writing_ = false;
         if (ec) {
-            if (self->onError_) self->onError_(ec);
+            self->reportError(ec);
             return;
         }
+        if (self->writeQueue_.empty()) return;  // dropped meanwhile (error reported on read side)
+        auto onComplete = std::move(self->writeQueue_.front().onComplete);
+        self->writeQueue_.pop_front();
+        if (!self->writeQueue_.empty()) self->doWrite();
         if (onComplete) onComplete();
     };
+    auto handler = boost::asio::bind_executor(strand_, std::move(onWritten));
     if (tls_) {
         boost::asio::async_write(*sslStream_, boost::asio::buffer(*msgPtr), std::move(handler));
     } else {
@@ -395,6 +442,7 @@ void PeerConnection::asyncWrite(Buffer msg, std::function<void()> onComplete) {
 // close
 // ============================================================================
 void PeerConnection::close() {
+    closed_ = true;
     if (socket_.is_open()) {
         boost::system::error_code ec;
         socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);

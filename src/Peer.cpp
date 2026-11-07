@@ -215,7 +215,7 @@ Peer::Peer(std::shared_ptr<PeerConnection> connection, boost::asio::io_context& 
     hopByHop_ = generateInitialHopByHop();
 }
 
-Peer::~Peer() { stopWatchdog(); }
+Peer::~Peer() { watchdogTimer_.cancel(); }  // last owner: no concurrent use left
 
 // ============================================================================
 // connect (client-side)
@@ -525,7 +525,7 @@ void Peer::startWatchdog() {
 
     auto self = shared_from_this();
     watchdogTimer_.expires_after(std::chrono::seconds(config_.watchdogIntervalSec));
-    watchdogTimer_.async_wait([self](const boost::system::error_code& ec) {
+    auto onExpiry = [self](const boost::system::error_code& ec) {
         if (ec) return;  // cancelled
         if (self->state_ != State::Open) return;
 
@@ -534,17 +534,28 @@ void Peer::startWatchdog() {
         auto dwr = self->buildDWR();
         self->connection_->asyncWrite(std::move(dwr));
         self->startWatchdog();  // reschedule
-    });
+    };
+    watchdogTimer_.async_wait(boost::asio::bind_executor(connection_->executor(), std::move(onExpiry)));
 }
 
-void Peer::stopWatchdog() { watchdogTimer_.cancel(); }
+void Peer::stopWatchdog() {
+    // The timer is only touched on the connection strand (it is armed there);
+    // close()/disconnect()/onError() may run on any thread.
+    auto self = weak_from_this().lock();
+    if (!self) {
+        watchdogTimer_.cancel();
+        return;
+    }
+    boost::asio::post(connection_->executor(), [self]() { self->watchdogTimer_.cancel(); });
+}
 
 // ============================================================================
 // setState
 // ============================================================================
 void Peer::setState(State newState) {
-    if (state_ == newState) return;
-    state_ = newState;
+    // exchange: concurrent identical transitions (e.g. two error handlers
+    // reporting Closed) notify once.
+    if (state_.exchange(newState) == newState) return;
     if (onState_) {
         onState_(shared_from_this(), newState);
     }

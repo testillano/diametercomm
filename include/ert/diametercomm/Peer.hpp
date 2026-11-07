@@ -162,7 +162,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
     void close();
 
     // --- Accessors ---
-    State state() const { return state_; }
+    State state() const { return state_.load(); }
     const std::string& remoteOriginHost() const { return remoteOriginHost_; }
     const std::string& remoteOriginRealm() const { return remoteOriginRealm_; }
     // Hop-by-Hop: per-connection sequence (this Peer), randomly seeded.
@@ -198,7 +198,8 @@ class Peer : public std::enable_shared_from_this<Peer> {
     Buffer buildDWA(const Buffer& dwr) const;
     Buffer buildDPA(const Buffer& dpr) const;
 
-    // Watchdog timer
+    // Watchdog timer: armed and fired on the connection strand; stopWatchdog()
+    // may be called from any thread (posts the cancel to the strand).
     void startWatchdog();
     void stopWatchdog();
 
@@ -217,7 +218,8 @@ class Peer : public std::enable_shared_from_this<Peer> {
     boost::asio::io_context& io_;
     std::shared_ptr<PeerConnection> connection_;
     Config config_;
-    State state_{State::Closed};
+    // Read from any thread (send/isReady); each transition fires once.
+    std::atomic<State> state_{State::Closed};
 
     // Hop-by-Hop is per-connection (per Peer); End-to-End is node-wide (shared
     // across all Peers of this process), per RFC 6733.

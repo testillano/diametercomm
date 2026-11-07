@@ -87,8 +87,13 @@ DiameterClient::DiameterClient(boost::asio::io_context& io, const Peer::Config& 
 
 DiameterClient::~DiameterClient() {
     reconnectEnabled_ = false;
-    reconnectTimer_.cancel();
+    cancelReconnect();
     close();
+}
+
+std::shared_ptr<Peer> DiameterClient::currentPeer() const {
+    std::lock_guard<std::mutex> lock(peerMutex_);
+    return peer_;
 }
 
 void DiameterClient::enableMetrics(ert::metrics::Metrics* metrics, const std::string& source) {
@@ -154,16 +159,32 @@ ert::metrics::labels_t DiameterClient::clientLabels(const std::string& commandCo
 void DiameterClient::connect(const std::string& host, uint16_t port) {
     host_ = host;
     port_ = port;
-    reconnectCurrent_ = reconnectInitial_;
+    {
+        std::lock_guard<std::mutex> lock(reconnectMutex_);
+        reconnectCurrent_ = reconnectInitial_;
+    }
+    openPeer();
+}
 
-    peer_ = std::make_shared<Peer>(io_, config_, transport_);
+void DiameterClient::openPeer() {
+    auto peer = std::make_shared<Peer>(io_, config_, transport_);
 
-    peer_->setStateCallback([this](std::shared_ptr<Peer> p, Peer::State s) { onPeerState(std::move(p), s); });
+    peer->setStateCallback([this](std::shared_ptr<Peer> p, Peer::State s) { onPeerState(std::move(p), s); });
 
-    peer_->setRequestCallback(
+    peer->setRequestCallback(
         [this](std::shared_ptr<Peer> p, Buffer&& msg) { onPeerRequest(std::move(p), std::move(msg)); });
 
-    peer_->connect(host_, port_);
+    // Publish before connecting: Peer::connect() reports its first state
+    // synchronously and onPeerState() ignores events of non-current peers.
+    std::shared_ptr<Peer> previous;
+    {
+        std::lock_guard<std::mutex> lock(peerMutex_);
+        previous = std::move(peer_);
+        peer_ = peer;
+    }
+    if (previous) previous->close();  // normally already closed (reconnect); its events are ignored
+
+    peer->connect(host_, port_);
 }
 
 // ============================================================================
@@ -171,7 +192,9 @@ void DiameterClient::connect(const std::string& host, uint16_t port) {
 // ============================================================================
 uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint32_t timeoutMs,
                               const ert::metrics::labels_t& additionalLabels, TransactionTimeoutCallback onTimeout) {
-    if (!peer_ || peer_->state() != Peer::State::Open) {
+    // One snapshot for the whole call: peer_ may be replaced meanwhile.
+    auto peer = currentPeer();
+    if (!peer || peer->state() != Peer::State::Open) {
         if (metrics_ && request.size() >= 20) {
             std::string commandCode = std::to_string(extractCommandCode(request));
             std::string applicationId = std::to_string(extractApplicationId(request));
@@ -189,14 +212,14 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
     // Assign hop-by-hop
     uint32_t hbh = extractHopByHop(request);
     if (hbh == 0) {
-        hbh = peer_->nextHopByHop();
+        hbh = peer->nextHopByHop();
         setHopByHop(request, hbh);
     }
     // Assign end-to-end here (Peer::send keeps a non-zero one) so it can be
     // indexed as the fallback correlation key.
     uint32_t e2e = extractEndToEnd(request);
     if (e2e == 0) {
-        e2e = peer_->nextEndToEnd();
+        e2e = peer->nextEndToEnd();
         setEndToEnd(request, e2e);
     }
 
@@ -229,13 +252,16 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
     // Set timeout
     if (timeoutMs > 0) {
         pending->timer.expires_after(std::chrono::milliseconds(timeoutMs));
-        pending->timer.async_wait([this, hbh, commandCode, applicationId](const boost::system::error_code& ec) {
+        // The handler acts only on ITS transaction: a reused (caller-provided)
+        // hop-by-hop may have replaced the entry meanwhile.
+        std::weak_ptr<PendingRequest> self = pending;
+        pending->timer.async_wait([this, hbh, self, commandCode, applicationId](const boost::system::error_code& ec) {
             if (ec) return;  // cancelled
             std::shared_ptr<PendingRequest> req;
             {
                 std::lock_guard<std::mutex> lock(pendingMutex_);
                 auto it = pending_.find(hbh);
-                if (it == pending_.end()) return;
+                if (it == pending_.end() || it->second != self.lock()) return;
                 req = it->second;
                 pendingByE2e_.erase(req->endToEnd);
                 pending_.erase(it);
@@ -252,7 +278,7 @@ uint32_t DiameterClient::send(Buffer request, ResponseCallback onResponse, uint3
 
     // Send the request. A refused write must not leave a pending entry behind
     // (it would only expire later as a misleading timeout).
-    if (!peer_->send(std::move(request))) {
+    if (!peer->send(std::move(request))) {
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
             auto it = pending_.find(hbh);
@@ -350,7 +376,8 @@ bool DiameterClient::resolve(const Buffer& msg, bool crossLeg) {
 // sendAnswer - reply to a server-initiated request on this connection
 // ============================================================================
 bool DiameterClient::sendAnswer(Buffer answer) {
-    if (!peer_ || answer.size() < 20) return false;
+    auto peer = currentPeer();
+    if (!peer || answer.size() < 20) return false;
 
     if (metrics_) {
         std::string commandCode = std::to_string(extractCommandCode(answer));
@@ -359,7 +386,7 @@ bool DiameterClient::sendAnswer(Buffer answer) {
         answers_sent_counter_family_ptr_->Add(clientLabels(commandCode, applicationId, {}, resultCode)).Increment();
     }
 
-    return peer_->send(std::move(answer));
+    return peer->send(std::move(answer));
 }
 
 // ============================================================================
@@ -367,8 +394,8 @@ bool DiameterClient::sendAnswer(Buffer answer) {
 // ============================================================================
 void DiameterClient::disconnect(uint32_t cause) {
     reconnectEnabled_ = false;
-    reconnectTimer_.cancel();
-    if (peer_) peer_->disconnect(cause);
+    cancelReconnect();
+    if (auto peer = currentPeer()) peer->disconnect(cause);
 }
 
 // ============================================================================
@@ -376,8 +403,8 @@ void DiameterClient::disconnect(uint32_t cause) {
 // ============================================================================
 void DiameterClient::close() {
     reconnectEnabled_ = false;
-    reconnectTimer_.cancel();
-    if (peer_) peer_->close();
+    cancelReconnect();
+    if (auto peer = currentPeer()) peer->close();
 
     // Cancel all pending requests
     std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -391,19 +418,32 @@ void DiameterClient::close() {
 // ============================================================================
 // isReady / state
 // ============================================================================
-bool DiameterClient::isReady() const { return peer_ && peer_->state() == Peer::State::Open; }
+bool DiameterClient::isReady() const {
+    auto peer = currentPeer();
+    return peer && peer->state() == Peer::State::Open;
+}
 
-Peer::State DiameterClient::state() const { return peer_ ? peer_->state() : Peer::State::Closed; }
+Peer::State DiameterClient::state() const {
+    auto peer = currentPeer();
+    return peer ? peer->state() : Peer::State::Closed;
+}
 
 // ============================================================================
 // onPeerState
 // ============================================================================
-void DiameterClient::onPeerState(std::shared_ptr<Peer> /*peer*/, Peer::State state) {
+void DiameterClient::onPeerState(std::shared_ptr<Peer> peer, Peer::State state) {
+    // Late events of a replaced connection (e.g. its Closed after a
+    // reconnect already created a new peer) must not drive this client.
+    if (peer != currentPeer()) return;
+
     if (onState_) onState_(state);
 
     if (state == Peer::State::Open) {
         // Reset reconnect backoff on successful connection
-        reconnectCurrent_ = reconnectInitial_;
+        {
+            std::lock_guard<std::mutex> lock(reconnectMutex_);
+            reconnectCurrent_ = reconnectInitial_;
+        }
 
         if (metrics_) {
             auto& gauge = peer_state_gauge_family_ptr_->Add({{"source", source_}});
@@ -469,6 +509,10 @@ void DiameterClient::onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg) {
 // scheduleReconnect
 // ============================================================================
 void DiameterClient::scheduleReconnect() {
+    std::lock_guard<std::mutex> lock(reconnectMutex_);
+    if (reconnectPending_ || !reconnectEnabled_) return;  // one armed reconnect per close
+    reconnectPending_ = true;
+
     LOGINFORMATIONAL(ert::tracing::Logger::informational(
         ert::tracing::Logger::asString("Diameter client: reconnecting to %s:%d in %ld ms", host_.c_str(), port_,
                                        reconnectCurrent_.count()),
@@ -476,14 +520,23 @@ void DiameterClient::scheduleReconnect() {
 
     reconnectTimer_.expires_after(reconnectCurrent_);
     reconnectTimer_.async_wait([this](const boost::system::error_code& ec) {
-        if (ec) return;  // cancelled
-
-        // Exponential backoff
-        reconnectCurrent_ = std::min(reconnectCurrent_ * 2, reconnectMax_);
-
-        // Reconnect
-        connect(host_, port_);
+        if (ec) return;  // cancelled (cancelReconnect already cleared the pending flag)
+        {
+            std::lock_guard<std::mutex> lock(reconnectMutex_);
+            reconnectPending_ = false;
+            if (!reconnectEnabled_) return;
+            // Exponential backoff
+            reconnectCurrent_ = std::min(reconnectCurrent_ * 2, reconnectMax_);
+        }
+        // Reconnect (outside the lock: the new peer reports states synchronously)
+        openPeer();
     });
+}
+
+void DiameterClient::cancelReconnect() {
+    std::lock_guard<std::mutex> lock(reconnectMutex_);
+    reconnectTimer_.cancel();
+    reconnectPending_ = false;
 }
 
 }  // namespace diametercomm

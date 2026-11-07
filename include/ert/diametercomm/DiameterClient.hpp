@@ -44,6 +44,7 @@ Copyright (c) 2024 Eduardo Ramos
 
 #pragma once
 
+#include <atomic>
 #include <boost/asio.hpp>
 #include <chrono>
 #include <cstdint>
@@ -217,6 +218,14 @@ class DiameterClient {
     void onPeerState(std::shared_ptr<Peer> peer, Peer::State state);
     void onPeerRequest(std::shared_ptr<Peer> peer, Buffer&& msg);
     void scheduleReconnect();
+    void cancelReconnect();
+
+    // Create a new Peer for host_/port_, publish it as the current one and
+    // connect it (initial connect and every reconnect).
+    void openPeer();
+    // Snapshot of the current peer: peer_ is replaced on reconnect (io thread)
+    // while send()/isReady() run on any thread.
+    std::shared_ptr<Peer> currentPeer() const;
 
     // Correlate an answer with a pending transaction (hbh, then e2e). Shared by
     // the local answer path and tryResolve (crossLeg=true).
@@ -242,6 +251,7 @@ class DiameterClient {
     boost::asio::io_context& io_;
     Peer::Config config_;
     Transport transport_;
+    mutable std::mutex peerMutex_;  // guards peer_ (never held while calling into the Peer)
     std::shared_ptr<Peer> peer_;
 
     std::string host_;
@@ -253,8 +263,12 @@ class DiameterClient {
     // Secondary index: end-to-end -> hop-by-hop (fallback correlation key)
     std::unordered_map<uint32_t, uint32_t> pendingByE2e_;
 
-    // Reconnect state
-    bool reconnectEnabled_{true};
+    // Reconnect state. reconnectMutex_ serializes every reconnectTimer_
+    // operation and the backoff; reconnectPending_ allows one armed reconnect
+    // (several error handlers may report the same close).
+    std::atomic<bool> reconnectEnabled_{true};
+    std::mutex reconnectMutex_;
+    bool reconnectPending_{false};
     std::chrono::milliseconds reconnectInitial_{10000};
     std::chrono::milliseconds reconnectMax_{30000};
     std::chrono::milliseconds reconnectCurrent_{1000};

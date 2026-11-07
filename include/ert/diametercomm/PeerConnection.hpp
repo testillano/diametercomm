@@ -32,9 +32,11 @@ Copyright (c) 2024 Eduardo Ramos
 
 #pragma once
 
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -108,11 +110,12 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
 
     ~PeerConnection();
 
-    // Non-copyable, movable
+    // Non-copyable, non-movable (owns a strand and in-flight operation state;
+    // always handled through shared_ptr).
     PeerConnection(const PeerConnection&) = delete;
     PeerConnection& operator=(const PeerConnection&) = delete;
-    PeerConnection(PeerConnection&&) = default;
-    PeerConnection& operator=(PeerConnection&&) = default;
+    PeerConnection(PeerConnection&&) = delete;
+    PeerConnection& operator=(PeerConnection&&) = delete;
 
     /**
      * Connect to a remote Diameter peer (client-side).
@@ -154,18 +157,37 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
 
     /**
      * Start reading Diameter messages from the connection.
+     *
+     * Threading: reads, writes and their handlers run on the connection strand
+     * (see executor()), so @p onMessage and @p onError are never invoked
+     * concurrently for the same connection. @p onError is invoked at most once
+     * (first read or write error).
      */
     void startReading(MessageCallback onMessage, ErrorCallback onError);
 
     /**
      * Write a complete Diameter message.
+     *
+     * Thread-safe: may be called from any thread. Messages are queued and
+     * written one at a time on the connection strand (a single outstanding
+     * async_write per socket), so concurrent callers never interleave bytes on
+     * the wire. @p onComplete runs on the strand once the message is fully
+     * written; it is not invoked if the write fails or the connection is
+     * closed before (pending messages are dropped on error/close).
      */
     void asyncWrite(Buffer msg, std::function<void()> onComplete = nullptr);
 
     /**
-     * Gracefully close the connection.
+     * Close the connection (synchronous). Further writes are dropped and
+     * outstanding operations complete with operation_aborted.
      */
     void close();
+
+    /**
+     * Strand serializing every operation and handler of this connection.
+     * Higher layers bind their per-connection timers to it.
+     */
+    const boost::asio::strand<boost::asio::any_io_executor>& executor() const { return strand_; }
 
     /**
      * Check if the connection is open.
@@ -214,9 +236,23 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
    private:
     void doReadHeader();
     void doReadBody(uint32_t msgLen);
+    void doWrite();                                      // strand only
+    void reportError(const boost::system::error_code&);  // strand only
 
     boost::asio::ip::tcp::socket socket_;
+    // Declared after socket_: built from its executor.
+    boost::asio::strand<boost::asio::any_io_executor> strand_;
     Transport transport_;
+
+    // Write queue (strand only): one async_write in flight at a time.
+    struct PendingWrite {
+        std::shared_ptr<Buffer> msg;
+        std::function<void()> onComplete;
+    };
+    std::deque<PendingWrite> writeQueue_;
+    bool writing_{false};
+    bool errorReported_{false};
+    std::atomic<bool> closed_{false};
     std::array<uint8_t, 4> headerBuf_;
     Buffer readBuf_;
 
