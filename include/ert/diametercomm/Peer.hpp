@@ -165,6 +165,11 @@ class Peer : public std::enable_shared_from_this<Peer> {
     State state() const { return state_.load(); }
     const std::string& remoteOriginHost() const { return remoteOriginHost_; }
     const std::string& remoteOriginRealm() const { return remoteOriginRealm_; }
+    // Connection endpoints ("<address>:<port>"; "<closed>" / "<unknown>" when not
+    // connected) and transport, for diagnostics (e.g. an admin peers listing).
+    std::string localEndpoint() const { return connection_->localEndpoint(); }
+    std::string remoteEndpoint() const { return connection_->remoteEndpoint(); }
+    Transport transport() const { return connection_->transport(); }
     // Hop-by-Hop: per-connection sequence (this Peer), randomly seeded.
     uint32_t nextHopByHop() { return hopByHop_.fetch_add(1); }
     // End-to-End: node-wide sequence shared by all Peers of this process

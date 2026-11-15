@@ -732,3 +732,47 @@ TEST_F(DiameterClient_test, TryResolveRejectsRequestsAndCommandMismatch) {
     client.close();
     server.close();
 }
+
+// Diagnostics accessors (e.g. an admin peers listing): the current peer with its
+// endpoints and remote identity, the remote host/port, the transport and the
+// reconnecting flag; the server peers give the same view of the other leg.
+TEST_F(DiameterClient_test, DiagnosticsAccessors) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 14897);
+
+    DiameterClient client(io_, clientConfig());
+    EXPECT_EQ(client.peer(), nullptr);  // before connect
+    EXPECT_FALSE(client.reconnecting());
+    client.setReconnectEnabled(true);
+    client.setReconnectBackoff(std::chrono::milliseconds(5000), std::chrono::milliseconds(5000));
+
+    client.connect("127.0.0.1", 14897);
+    runFor(std::chrono::milliseconds(300));
+    ASSERT_TRUE(client.isReady());
+    EXPECT_EQ(client.remoteHost(), "127.0.0.1");
+    EXPECT_EQ(client.remotePort(), 14897);
+    EXPECT_EQ(client.transport(), Transport::TCP);
+
+    auto peer = client.peer();
+    ASSERT_NE(peer, nullptr);
+    EXPECT_EQ(peer->remoteOriginHost(), "server.example.com");
+    EXPECT_EQ(peer->remoteOriginRealm(), "example.com");
+    EXPECT_EQ(peer->remoteEndpoint(), "127.0.0.1:14897");
+    EXPECT_EQ(peer->localEndpoint().rfind("127.0.0.1:", 0), 0u) << peer->localEndpoint();
+    EXPECT_EQ(peer->transport(), Transport::TCP);
+
+    auto serverPeers = server.peers();
+    ASSERT_EQ(serverPeers.size(), 1u);
+    EXPECT_EQ(serverPeers[0]->remoteOriginHost(), "client.example.com");
+    EXPECT_EQ(serverPeers[0]->localEndpoint(), "127.0.0.1:14897");
+    EXPECT_EQ(serverPeers[0]->remoteEndpoint(), peer->localEndpoint());
+    EXPECT_FALSE(client.reconnecting());
+
+    // Connection lost: a reconnection is scheduled (long backoff: still pending)
+    server.close();
+    runFor(std::chrono::milliseconds(200));
+    EXPECT_FALSE(client.isReady());
+    EXPECT_TRUE(client.reconnecting());
+
+    client.close();
+}

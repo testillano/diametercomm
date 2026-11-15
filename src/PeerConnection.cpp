@@ -470,5 +470,15 @@ std::string PeerConnection::remoteEndpoint() const {
     }
 }
 
+std::string PeerConnection::localEndpoint() const {
+    if (!socket_.is_open()) return "<closed>";
+    boost::system::error_code ec;
+    auto ep = socket_.local_endpoint(ec);
+    if (ec) return "<unknown>";
+    std::ostringstream oss;
+    oss << ep.address().to_string() << ":" << ep.port();
+    return oss.str();
+}
+
 }  // namespace diametercomm
 }  // namespace ert

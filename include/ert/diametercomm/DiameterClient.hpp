@@ -184,6 +184,26 @@ class DiameterClient {
      */
     Peer::State state() const;
 
+    /**
+     * Current peer of the connection (replaced on every reconnect), for
+     * diagnostics: endpoints, remote Origin-Host / Origin-Realm. nullptr before
+     * the first connect.
+     */
+    std::shared_ptr<Peer> peer() const { return currentPeer(); }
+
+    /**
+     * True while a reconnection is scheduled (the connection was lost and the
+     * backoff timer is armed).
+     */
+    bool reconnecting() const;
+
+    /** Remote host and port given to connect(). */
+    const std::string& remoteHost() const { return host_; }
+    uint16_t remotePort() const { return port_; }
+
+    /** Transport of the connection. */
+    Transport transport() const { return transport_; }
+
     // --- Callbacks ---
     /** Called for unsolicited requests (server-initiated on this connection) */
     void setRequestCallback(RequestCallback cb) { onRequest_ = std::move(cb); }
@@ -267,7 +287,7 @@ class DiameterClient {
     // operation and the backoff; reconnectPending_ allows one armed reconnect
     // (several error handlers may report the same close).
     std::atomic<bool> reconnectEnabled_{true};
-    std::mutex reconnectMutex_;
+    mutable std::mutex reconnectMutex_;
     bool reconnectPending_{false};
     std::chrono::milliseconds reconnectInitial_{10000};
     std::chrono::milliseconds reconnectMax_{30000};

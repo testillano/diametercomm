@@ -428,6 +428,11 @@ Peer::State DiameterClient::state() const {
     return peer ? peer->state() : Peer::State::Closed;
 }
 
+bool DiameterClient::reconnecting() const {
+    std::lock_guard<std::mutex> lock(reconnectMutex_);
+    return reconnectPending_;
+}
+
 // ============================================================================
 // onPeerState
 // ============================================================================

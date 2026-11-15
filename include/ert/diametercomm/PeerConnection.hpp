@@ -200,6 +200,12 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
     std::string remoteEndpoint() const;
 
     /**
+     * Get the local endpoint description ("<address>:<port>"; "<closed>" or
+     * "<unknown>" when the socket is not connected).
+     */
+    std::string localEndpoint() const;
+
+    /**
      * Get the underlying socket (for acceptor usage).
      */
     boost::asio::ip::tcp::socket& socket() { return socket_; }
