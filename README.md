@@ -1,7 +1,7 @@
 # C++ diametercomm library
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Documentation](https://codedocs.xyz/testillano/diametercomm.svg)](https://codedocs.xyz/testillano/diametercomm/index.html)
+[![Documentation](https://img.shields.io/badge/docs-doxygen-blue.svg)](https://testillano.github.io/diametercomm/doxygen/)
 [![Coverage Status](https://img.shields.io/endpoint?url=https://testillano.github.io/diametercomm/badge.json)](https://testillano.github.io/diametercomm)
 [![Ask Me Anything !](https://img.shields.io/badge/Ask%20me-anything-1abc9c.svg)](https://github.com/testillano)
 [![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/testillano/diametercomm/graphs/commit-activity)

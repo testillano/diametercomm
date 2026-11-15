@@ -35,6 +35,14 @@ jobs:
           sources=$(find . -name "*.hpp" -o -name "*.cpp")
           docker run --rm -v $PWD:/data ghcr.io/testillano/clang-format:latest --dry-run -Werror ${sources}
 
+  # Doxygen html for the GitHub Pages site (doxygen/), formerly served by codedocs.xyz
+  doxygen:
+    uses: testillano/workflows/.github/workflows/doxygen.yml@v1
+    with:
+      doxyfile_dir: docs/doxygen
+      doxyfile_overrides: |
+        PROJECT_NUMBER=${{ github.ref_name }}
+
   build_and_push_docker_images_as_local:
     needs: format_style
     name: Build and push docker images as local
@@ -151,9 +159,6 @@ jobs:
         genhtml final-coverage.info --output-directory /code/coverage
         cp final-coverage.info /code/coverage/lcov.info
     -
-      name: Setup Pages
-      uses: actions/configure-pages@v3
-    -
       name: Create badge json file
       run: |
         value=$(grep -oP 'headerCovTableEntry(Hi|Med|Lo)">[0-9]+\.[0-9]+' /code/coverage/index.html | grep -oP '[0-9]+\.[0-9]+' | head -n 1)
@@ -167,12 +172,54 @@ jobs:
 
         echo '{"schemaVersion":1,"label":"coverage","message":"'${value}'%","color":"'${color}'"}' > /code/coverage/badge.json
     -
-      name: Upload artifact
+      name: Upload coverage artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-html
+        path: /code/coverage
+        if-no-files-found: error
+        # Consumed by 'deploy_pages' in the same run
+        retention-days: 1
+
+  # Deploy the Pages site in a dedicated job on a clean runner: actions/deploy-pages@v4
+  # requires the 'github-pages' environment to be declared on the job.
+  deploy_pages:
+    needs: [unit_tests_and_coverage, doxygen]
+    name: Deploy GitHub Pages
+    runs-on: ubuntu-latest
+    # Do not fail the whole pipeline if Pages hiccups:
+    continue-on-error: true
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    -
+      name: Setup Pages
+      uses: actions/configure-pages@v3
+    -
+      # Coverage keeps the site root (its badge.json url is unchanged)
+      name: Download coverage html
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-html
+        path: site
+    -
+      name: Download doxygen html
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ needs.doxygen.outputs.artifact_name }}
+        path: site/doxygen
+    -
+      name: Upload Pages artifact
       uses: actions/upload-pages-artifact@v3
       with:
-        path: /code/coverage
+        path: site
     -
       name: Deploy to GitHub Pages
+      id: deployment
       uses: actions/deploy-pages@v4
 
   push_docker_images_as_latest:
