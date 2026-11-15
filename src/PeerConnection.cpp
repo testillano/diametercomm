@@ -161,154 +161,220 @@ std::string PeerConnection::deriveSourceAddress(const boost::asio::ip::address& 
 // asyncConnect (client-side)
 // ============================================================================
 void PeerConnection::asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected,
-                                  ErrorCallback onError, const std::string& localAddress) {
-    auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(socket_.get_executor());
-
+                                  ErrorCallback onError, const std::string& localAddress,
+                                  const SctpOptions& sctpOptions) {
     auto self = shared_from_this();
+
+    // A list of peer addresses (multihoming): SCTP only, no resolution (addresses).
+    if (sctp::isAddressList(host)) {
+        std::vector<boost::asio::ip::address> peers;
+        const std::string err = sctp::parseAddressList(host, peers);
+        if (transport_ != Transport::SCTP || !err.empty()) {
+            LOGWARNING(ert::tracing::Logger::warning(
+                ert::tracing::Logger::asString("Invalid peer address list '%s': %s", host.c_str(),
+                                               transport_ != Transport::SCTP ? "a list needs SCTP" : err.c_str()),
+                ERT_FILE_LOCATION));
+            boost::asio::post(strand_, [onError]() {
+                if (onError) onError(boost::asio::error::invalid_argument);
+            });
+            return;
+        }
+        boost::asio::post(strand_, [self, peers, port, onConnected, onError, localAddress, sctpOptions]() {
+            self->connectSctp(peers, port, onConnected, onError, localAddress, sctpOptions);
+        });
+        return;
+    }
+
+    auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(socket_.get_executor());
     resolver->async_resolve(
         host, std::to_string(port),
-        boost::asio::bind_executor(
-            strand_, [self, resolver, onConnected, onError, localAddress](
-                         const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::results_type results) {
-                if (ec) {
-                    if (onError) onError(ec);
+        boost::asio::bind_executor(strand_, [self, resolver, onConnected, onError, localAddress, port, sctpOptions](
+                                                const boost::system::error_code& ec,
+                                                boost::asio::ip::tcp::resolver::results_type results) {
+            if (ec) {
+                if (onError) onError(ec);
+                return;
+            }
+
+            if (self->transport_ == Transport::SCTP) {
+                auto it = results.begin();
+                if (it == results.end()) {
+                    if (onError) onError(boost::asio::error::host_not_found);
                     return;
                 }
+                self->connectSctp({it->endpoint().address()}, port, onConnected, onError, localAddress, sctpOptions);
+                return;
+            }
 
-                if (self->transport_ == Transport::SCTP) {
-                    // For SCTP: create native socket and assign to tcp::socket
-                    auto it = results.begin();
-                    if (it == results.end()) {
-                        if (onError) onError(boost::asio::error::host_not_found);
-                        return;
-                    }
-                    int family = it->endpoint().address().is_v6() ? AF_INET6 : AF_INET;
-                    bool isV6 = (family == AF_INET6);
-                    int fd = ::socket(family, SOCK_STREAM, IPPROTO_SCTP);
-                    if (fd < 0) {
-                        if (onError)
-                            onError(boost::system::errc::make_error_code(boost::system::errc::protocol_not_supported));
-                        return;
-                    }
-                    boost::system::error_code assign_ec;
-                    auto proto = isV6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4();
-                    self->socket_.assign(proto, fd, assign_ec);
-                    if (assign_ec) {
-                        ::close(fd);
-                        if (onError) onError(assign_ec);
-                        return;
-                    }
-
-                    // SCTP single-homing: bind the socket to ONE local source
-                    // address before connecting, so the INIT advertises only that
-                    // address (not every local interface). See deriveSourceAddress()
-                    // above for the full rationale (SCTP multihoming would otherwise
-                    // advertise non-routable addresses like docker0 and stall the
-                    // handshake in COOKIE_WAIT).
-                    //
-                    // Address selection:
-                    //   - localAddress NON-EMPTY  -> explicit override: bind exactly
-                    //     to it. Use this to PIN the egress interface when the kernel
-                    //     route would pick a path the peer does not accept (asymmetric
-                    //     routing, or a VIP reachable only via a specific interface).
-                    //     The caller is responsible for providing an address the peer
-                    //     can actually reach (and that the host can egress from).
-                    //   - localAddress EMPTY (default) -> auto-derive the egress source
-                    //     toward the peer (deriveSourceAddress). This is the kernel's
-                    //     own route decision, so the advertised address matches where
-                    //     the traffic actually leaves from.
-                    //   - derivation fails -> leave the socket unbound (legacy
-                    //     behavior); better to try than to abort the connect.
-                    //
-                    // A failed bind (e.g. the given address is not local) is surfaced
-                    // via onError rather than silently ignored.
-                    {
-                        std::string local = localAddress;
-                        bool explicitPin = !local.empty();
-                        if (local.empty()) local = PeerConnection::deriveSourceAddress(it->endpoint().address());
-                        if (!local.empty()) {
-                            boost::system::error_code addr_ec;
-                            auto laddr = boost::asio::ip::make_address(local, addr_ec);
-                            if (!addr_ec) {
-                                boost::system::error_code bind_ec;
-                                self->socket_.bind(boost::asio::ip::tcp::endpoint(laddr, 0), bind_ec);
-                                if (bind_ec) {
-                                    if (onError) onError(bind_ec);
-                                    return;
-                                }
-                                // Startup visibility: report the single local source address the
-                                // SCTP INIT will advertise, and whether it was pinned explicitly
-                                // (--diameter-client-local-host / Config::localAddress) or
-                                // auto-derived from the route toward the peer.
-                                LOGWARNING(ert::tracing::Logger::warning(
-                                    ert::tracing::Logger::asString(
-                                        "SCTP client source address (advertised in INIT): %s [%s]", local.c_str(),
-                                        explicitPin ? "explicit" : "auto-derived"),
-                                    ERT_FILE_LOCATION));
-                            } else if (explicitPin) {
-                                // An explicit address that does not parse is a config error worth flagging.
-                                LOGWARNING(ert::tracing::Logger::warning(
-                                    ert::tracing::Logger::asString(
-                                        "SCTP client local address '%s' is not a valid IP; leaving socket unbound",
-                                        local.c_str()),
-                                    ERT_FILE_LOCATION));
-                            }
-                        } else {
-                            // Could not determine a source address: unbound (legacy multihomed INIT).
-                            LOGWARNING(ert::tracing::Logger::warning(
-                                "SCTP client source address could not be derived; socket left unbound "
-                                "(INIT will advertise all local addresses)",
-                                ERT_FILE_LOCATION));
-                        }
-                    }
-
-                    // Single-homing: connect the assigned SCTP socket to the single
-                    // resolved endpoint via the member async_connect. We must NOT use
-                    // the range free-function async_connect here: it closes/reopens
-                    // the socket for each candidate endpoint (reopening as TCP via
-                    // endpoint.protocol()), which would silently discard our SCTP fd.
-                    boost::asio::ip::tcp::endpoint endpoint = it->endpoint();
-                    auto onSctpConnect = [self, onConnected, onError](const boost::system::error_code& ec2) {
+            // TCP: standard range connect (tries each resolved endpoint in turn).
+            boost::asio::async_connect(
+                self->socket_, results,
+                boost::asio::bind_executor(
+                    self->strand_, [self, onConnected, onError](const boost::system::error_code& ec2,
+                                                                const boost::asio::ip::tcp::endpoint&) {
                         if (ec2) {
                             if (onError) onError(ec2);
                             return;
                         }
-                        if (onConnected) onConnected();
-                    };
-                    self->socket_.async_connect(endpoint,
-                                                boost::asio::bind_executor(self->strand_, std::move(onSctpConnect)));
+                        // Disable Nagle for TCP
+                        self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
+                        if (self->tls_) {
+                            // TLS/TCP: perform client handshake before signalling connected.
+                            auto onHandshake = [self, onConnected, onError](const boost::system::error_code& hec) {
+                                if (hec) {
+                                    if (onError) onError(hec);
+                                    return;
+                                }
+                                if (onConnected) onConnected();
+                            };
+                            self->sslStream_->async_handshake(
+                                boost::asio::ssl::stream_base::client,
+                                boost::asio::bind_executor(self->strand_, std::move(onHandshake)));
+                        } else {
+                            if (onConnected) onConnected();
+                        }
+                    }));
+        }));
+}
+
+// ============================================================================
+// connectSctp (strand): one-to-one SCTP socket, local binding (single or
+// multihomed), options, connect to one or several peer addresses
+// ============================================================================
+void PeerConnection::connectSctp(std::vector<boost::asio::ip::address> peers, uint16_t port,
+                                 std::function<void()> onConnected, ErrorCallback onError,
+                                 const std::string& localAddress, const SctpOptions& sctpOptions) {
+    auto self = shared_from_this();
+    const bool isV6 = peers.front().is_v6();
+    int fd = ::socket(isV6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_SCTP);
+    if (fd < 0) {
+        if (onError) onError(boost::system::errc::make_error_code(boost::system::errc::protocol_not_supported));
+        return;
+    }
+    boost::system::error_code assign_ec;
+    socket_.assign(isV6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4(), fd, assign_ec);
+    if (assign_ec) {
+        ::close(fd);
+        if (onError) onError(assign_ec);
+        return;
+    }
+
+    const std::string optionsErr = sctp::applyOptions(fd, sctpOptions);
+    if (!optionsErr.empty()) {
+        LOGWARNING(ert::tracing::Logger::warning(
+            ert::tracing::Logger::asString("SCTP options not applied: %s", optionsErr.c_str()), ERT_FILE_LOCATION));
+    }
+
+    // Local addresses. Single-homing (one address: explicit, or derived from the
+    // route toward the first peer) avoids advertising non-routable local
+    // interfaces (docker0, bridges) in the INIT, which would stall the handshake
+    // in COOKIE_WAIT (see deriveSourceAddress). Multihoming (a list): every given
+    // address is bound and advertised (SCTP_SOCKOPT_BINDX_ADD).
+    {
+        std::vector<boost::asio::ip::address> locals;
+        std::string source = localAddress;
+        const bool explicitPin = !source.empty();
+        if (source.empty()) source = PeerConnection::deriveSourceAddress(peers.front());
+        if (!source.empty()) {
+            const std::string err = sctp::parseAddressList(source, locals);
+            if (!err.empty()) {
+                if (explicitPin) {
+                    LOGWARNING(ert::tracing::Logger::warning(
+                        ert::tracing::Logger::asString("SCTP client local address '%s': %s; leaving socket unbound",
+                                                       source.c_str(), err.c_str()),
+                        ERT_FILE_LOCATION));
+                }
+                locals.clear();
+            } else {
+                const std::string bindErr = sctp::bindAll(fd, locals, 0);
+                if (!bindErr.empty()) {
+                    LOGWARNING(ert::tracing::Logger::warning(
+                        ert::tracing::Logger::asString("SCTP client bind failed: %s", bindErr.c_str()),
+                        ERT_FILE_LOCATION));
+                    if (onError)
+                        onError(boost::system::errc::make_error_code(boost::system::errc::address_not_available));
                     return;
                 }
+                LOGWARNING(ert::tracing::Logger::warning(
+                    ert::tracing::Logger::asString("SCTP client source address(es) (advertised in INIT): %s [%s]",
+                                                   source.c_str(), explicitPin ? "explicit" : "auto-derived"),
+                    ERT_FILE_LOCATION));
+            }
+        } else {
+            LOGWARNING(
+                ert::tracing::Logger::warning("SCTP client source address could not be derived; socket left unbound "
+                                              "(INIT will advertise all local addresses)",
+                                              ERT_FILE_LOCATION));
+        }
+    }
 
-                // TCP: standard range connect (tries each resolved endpoint in turn).
-                boost::asio::async_connect(
-                    self->socket_, results,
-                    boost::asio::bind_executor(
-                        self->strand_, [self, onConnected, onError](const boost::system::error_code& ec2,
-                                                                    const boost::asio::ip::tcp::endpoint&) {
-                            if (ec2) {
-                                if (onError) onError(ec2);
-                                return;
-                            }
-                            // Disable Nagle for TCP
-                            self->socket_.set_option(boost::asio::ip::tcp::no_delay(true));
-                            if (self->tls_) {
-                                // TLS/TCP: perform client handshake before signalling connected.
-                                auto onHandshake = [self, onConnected, onError](const boost::system::error_code& hec) {
-                                    if (hec) {
-                                        if (onError) onError(hec);
-                                        return;
-                                    }
-                                    if (onConnected) onConnected();
-                                };
-                                self->sslStream_->async_handshake(
-                                    boost::asio::ssl::stream_base::client,
-                                    boost::asio::bind_executor(self->strand_, std::move(onHandshake)));
-                            } else {
-                                if (onConnected) onConnected();
-                            }
-                        }));
+    // Once connected: the primary peer address (when asked), then the caller.
+    auto connected = [self, port, onConnected, sctpOptions]() {
+        if (!sctpOptions.primaryPeerAddress.empty()) {
+            boost::system::error_code ec;
+            const auto primary = boost::asio::ip::make_address(sctpOptions.primaryPeerAddress, ec);
+            const std::string err =
+                ec ? "invalid address" : sctp::setPrimary(self->socket_.native_handle(), primary, port);
+            if (!err.empty()) {
+                LOGWARNING(ert::tracing::Logger::warning(
+                    ert::tracing::Logger::asString("SCTP primary peer address '%s' not set: %s",
+                                                   sctpOptions.primaryPeerAddress.c_str(), err.c_str()),
+                    ERT_FILE_LOCATION));
+            }
+        }
+        if (onConnected) onConnected();
+    };
+
+    if (peers.size() == 1) {
+        // Member async_connect (the range free function would close/reopen the
+        // socket as TCP for each candidate, discarding our SCTP fd).
+        boost::asio::ip::tcp::endpoint endpoint(peers.front(), port);
+        socket_.async_connect(
+            endpoint, boost::asio::bind_executor(strand_, [onError, connected](const boost::system::error_code& ec) {
+                if (ec) {
+                    if (onError) onError(ec);
+                    return;
+                }
+                connected();
             }));
+        return;
+    }
+
+    // Several peer addresses: non blocking SCTP_SOCKOPT_CONNECTX, then wait for
+    // the socket to be writable and read the connection outcome (SO_ERROR).
+    boost::system::error_code nb_ec;
+    socket_.non_blocking(true, nb_ec);
+    const int err = sctp::connectAll(fd, peers, port);
+    if (err != 0) {
+        if (onError) onError(boost::system::error_code(err, boost::system::system_category()));
+        return;
+    }
+    socket_.async_wait(
+        boost::asio::ip::tcp::socket::wait_write,
+        boost::asio::bind_executor(strand_, [self, onError, connected](const boost::system::error_code& ec) {
+            if (ec) {
+                if (onError) onError(ec);
+                return;
+            }
+            int soError = 0;
+            socklen_t len = sizeof(soError);
+            ::getsockopt(self->socket_.native_handle(), SOL_SOCKET, SO_ERROR, &soError, &len);
+            if (soError != 0) {
+                if (onError) onError(boost::system::error_code(soError, boost::system::system_category()));
+                return;
+            }
+            connected();
+        }));
+}
+
+std::vector<sctp::PathInfo> PeerConnection::sctpPaths() const {
+    if (transport_ != Transport::SCTP || !socket_.is_open()) return {};
+    return sctp::paths(const_cast<boost::asio::ip::tcp::socket&>(socket_).native_handle());
+}
+
+std::vector<std::string> PeerConnection::sctpLocalAddresses() const {
+    if (transport_ != Transport::SCTP || !socket_.is_open()) return {};
+    return sctp::localAddresses(const_cast<boost::asio::ip::tcp::socket&>(socket_).native_handle());
 }
 
 // ============================================================================

@@ -11,6 +11,7 @@ Licensed under the MIT License. Copyright (c) 2024 Eduardo Ramos
 
 #include <algorithm>
 #include <ert/diametercomm/DiameterServer.hpp>
+#include <ert/diametercomm/Sctp.hpp>
 #include <ert/tracing/Logger.hpp>
 
 namespace ert {
@@ -137,30 +138,37 @@ void DiameterServer::enableMetrics(ert::metrics::Metrics* metrics, const std::st
 
 void DiameterServer::listen(const std::string& bindAddress, uint16_t port) {
     if (transport_ == Transport::SCTP) {
-        // For SCTP: create native socket, bind, listen, then assign to acceptor
-        int family = AF_INET;
-        int fd = ::socket(family, SOCK_STREAM, IPPROTO_SCTP);
+        // For SCTP: create native socket, bind (one address, or several for
+        // multihoming), listen, then assign to the acceptor. IPv4 or IPv6.
+        std::vector<boost::asio::ip::address> addresses;
+        const std::string err = sctp::parseAddressList(bindAddress, addresses);
+        if (!err.empty()) throw std::runtime_error("Invalid SCTP bind address: " + err);
+        const bool isV6 = addresses.front().is_v6();
+        int fd = ::socket(isV6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_SCTP);
         if (fd < 0) throw std::runtime_error("Failed to create SCTP socket");
 
         int reuse = 1;
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-        struct sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        inet_pton(AF_INET, bindAddress.c_str(), &addr.sin_addr);
-
-        if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        const std::string optionsErr = sctp::applyOptions(fd, config_.sctp);
+        if (!optionsErr.empty()) {
+            LOGWARNING(ert::tracing::Logger::warning(
+                ert::tracing::Logger::asString("SCTP options not applied: %s", optionsErr.c_str()), ERT_FILE_LOCATION));
+        }
+        const std::string bindErr = sctp::bindAll(fd, addresses, port);
+        if (!bindErr.empty()) {
             ::close(fd);
-            throw std::runtime_error("Failed to bind SCTP socket");
+            throw std::runtime_error("Failed to bind SCTP socket: " + bindErr);
         }
         if (::listen(fd, SOMAXCONN) < 0) {
             ::close(fd);
             throw std::runtime_error("Failed to listen on SCTP socket");
         }
 
-        acceptor_.assign(boost::asio::ip::tcp::v4(), fd);
+        acceptor_.assign(isV6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4(), fd);
     } else {
+        if (sctp::isAddressList(bindAddress))
+            throw std::runtime_error("A list of bind addresses needs SCTP: '" + bindAddress + "'");
         // TCP: standard boost::asio approach
         boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::make_address(bindAddress), port);
         acceptor_.open(endpoint.protocol());

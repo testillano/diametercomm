@@ -98,6 +98,10 @@ class DiameterServer {
     /**
      * Start listening on the given address and port.
      * Begins accepting connections immediately.
+     * SCTP: @p bindAddress may be a comma separated list (multihomed listener,
+     * all of the same family), IPv4 or IPv6; Config::sctp heartbeat interval and
+     * path max retransmissions apply to the accepted associations. TCP: one
+     * address (IPv4 or IPv6).
      */
     void listen(const std::string &bindAddress, uint16_t port);
 

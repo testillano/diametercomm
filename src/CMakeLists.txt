@@ -3,6 +3,7 @@ add_library(${ERT_DIAMETERCOMM_TARGET_NAME} STATIC
     Peer.cpp
     DiameterServer.cpp
     DiameterClient.cpp
+    Sctp.cpp
 )
 
 target_include_directories(${ERT_DIAMETERCOMM_TARGET_NAME}

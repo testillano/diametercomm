@@ -37,6 +37,7 @@ Copyright (c) 2024 Eduardo Ramos
 #include <boost/asio/ssl.hpp>
 #include <cstdint>
 #include <deque>
+#include <ert/diametercomm/Sctp.hpp>
 #include <functional>
 #include <memory>
 #include <string>
@@ -144,7 +145,12 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
      *   Harmless for TCP (pins the source address; no multihoming involved).
      */
     void asyncConnect(const std::string& host, uint16_t port, std::function<void()> onConnected, ErrorCallback onError,
-                      const std::string& localAddress = "");
+                      const std::string& localAddress = "", const SctpOptions& sctpOptions = {});
+    // SCTP multihoming (asyncConnect): @p host may be a comma separated list of
+    // peer addresses (SCTP_SOCKOPT_CONNECTX; TCP rejects a list) and
+    // @p localAddress a list of local addresses (bound with SCTP_SOCKOPT_BINDX_ADD),
+    // all of the same family. @p sctpOptions: heartbeat interval, path max
+    // retransmissions and primary peer address (see Sctp.hpp).
 
     /**
      * Derive the local source address the kernel would use to reach @p peer,
@@ -205,6 +211,12 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
      */
     std::string localEndpoint() const;
 
+    /** SCTP: peer addresses (paths) of the association with their state; empty for TCP. */
+    std::vector<sctp::PathInfo> sctpPaths() const;
+
+    /** SCTP: local addresses of the association; empty for TCP. */
+    std::vector<std::string> sctpLocalAddresses() const;
+
     /**
      * Get the underlying socket (for acceptor usage).
      */
@@ -240,6 +252,10 @@ class PeerConnection : public std::enable_shared_from_this<PeerConnection> {
     static std::shared_ptr<boost::asio::ssl::context> makeClientContext(const TlsConfig& tls);
 
    private:
+    // SCTP connect to one or several peer addresses (see asyncConnect).
+    void connectSctp(std::vector<boost::asio::ip::address> peers, uint16_t port, std::function<void()> onConnected,
+                     ErrorCallback onError, const std::string& localAddress, const SctpOptions& sctpOptions);
+
     void doReadHeader();
     void doReadBody(uint32_t msgLen);
     void doWrite();                                      // strand only

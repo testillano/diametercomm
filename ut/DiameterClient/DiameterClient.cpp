@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <netinet/in.h>
+#include <netinet/sctp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -7,6 +8,8 @@
 #include <chrono>
 #include <ert/diametercomm/DiameterClient.hpp>
 #include <ert/diametercomm/DiameterServer.hpp>
+#include <ert/diametercomm/Sctp.hpp>
+#include <set>
 
 using namespace ert::diametercomm;
 
@@ -825,4 +828,114 @@ TEST_F(DiameterClient_test, FaultInjectionControls) {
 
     client.close();
     server.close();
+}
+
+// =============================================================================
+// SCTP multihoming: address lists, a multihomed association over loopback
+// aliases (the whole 127/8 is local), paths and primary, IPv6, TCP rejection.
+// =============================================================================
+
+TEST(Sctp_test, ParseAddressList) {
+    std::vector<boost::asio::ip::address> a;
+    EXPECT_EQ(sctp::parseAddressList("10.0.0.1", a), "");
+    EXPECT_EQ(a.size(), 1u);
+    EXPECT_EQ(sctp::parseAddressList("10.0.0.1, 10.0.0.2 ,10.0.0.3", a), "");
+    ASSERT_EQ(a.size(), 3u);
+    EXPECT_EQ(a[2].to_string(), "10.0.0.3");
+    EXPECT_EQ(sctp::parseAddressList("2001:db8::1,2001:db8::2", a), "");
+    EXPECT_TRUE(a[0].is_v6());
+    EXPECT_NE(sctp::parseAddressList("10.0.0.1,2001:db8::1", a), "");  // mixed families
+    EXPECT_NE(sctp::parseAddressList("10.0.0.1,,10.0.0.2", a), "");    // empty item
+    EXPECT_NE(sctp::parseAddressList("", a), "");
+    EXPECT_NE(sctp::parseAddressList("host.example.com", a), "");  // addresses only
+    EXPECT_TRUE(sctp::isAddressList("a,b"));
+    EXPECT_FALSE(sctp::isAddressList("a"));
+    EXPECT_EQ(sctp::stateName(SCTP_ACTIVE), "active");
+    EXPECT_EQ(sctp::stateName(SCTP_INACTIVE), "inactive");
+    EXPECT_EQ(sctp::stateName(SCTP_PF), "potentiallyFailed");
+    EXPECT_EQ(sctp::stateName(SCTP_UNCONFIRMED), "unconfirmed");
+}
+
+TEST_F(DiameterClient_test, MultihomedAssociation_SCTP) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+
+    auto sConfig = serverConfig();
+    sConfig.sctp.heartbeatIntervalMs = 200;
+    sConfig.sctp.pathMaxRetrans = 3;
+    DiameterServer server(io_, sConfig, Transport::SCTP);
+    server.listen("127.0.0.1,127.0.0.2", 14899);
+
+    auto cConfig = clientConfig();
+    cConfig.localAddress = "127.0.0.3,127.0.0.4";
+    cConfig.sctp.heartbeatIntervalMs = 200;
+    cConfig.sctp.primaryPeerAddress = "127.0.0.2";
+    DiameterClient client(io_, cConfig, Transport::SCTP);
+    client.setReconnectEnabled(false);
+    client.connect("127.0.0.1,127.0.0.2", 14899);
+    runFor(std::chrono::milliseconds(1500));  // heartbeats confirm the paths
+    ASSERT_TRUE(client.isReady());
+
+    // client side: two paths (the peer addresses), the asked primary, both local addresses
+    auto paths = client.peer()->sctpPaths();
+    ASSERT_EQ(paths.size(), 2u);
+    std::set<std::string> addresses;
+    int primaries = 0;
+    for (const auto& p : paths) {
+        addresses.insert(p.address);
+        if (p.primary) {
+            ++primaries;
+            EXPECT_EQ(p.address, "127.0.0.2");
+        }
+        EXPECT_EQ(p.state, "active") << p.address;
+    }
+    EXPECT_EQ(addresses, (std::set<std::string>{"127.0.0.1", "127.0.0.2"}));
+    EXPECT_EQ(primaries, 1);
+    auto locals = client.peer()->sctpLocalAddresses();
+    EXPECT_EQ(std::set<std::string>(locals.begin(), locals.end()), (std::set<std::string>{"127.0.0.3", "127.0.0.4"}));
+
+    // server side: the client addresses are its paths
+    auto serverPeers = server.peers();
+    ASSERT_EQ(serverPeers.size(), 1u);
+    std::set<std::string> serverPaths;
+    for (const auto& p : serverPeers[0]->sctpPaths()) serverPaths.insert(p.address);
+    EXPECT_EQ(serverPaths, (std::set<std::string>{"127.0.0.3", "127.0.0.4"}));
+
+    // TCP connections report no paths
+    EXPECT_TRUE(PeerConnection(io_, Transport::TCP).sctpPaths().empty());
+
+    client.close();
+    server.close();
+}
+
+TEST_F(DiameterClient_test, Ipv6Association_SCTP) {
+    if (!sctpAvailable()) GTEST_SKIP() << "SCTP not available in this environment";
+    int fd = ::socket(AF_INET6, SOCK_STREAM, IPPROTO_SCTP);
+    if (fd < 0) GTEST_SKIP() << "SCTP over IPv6 not available";
+    ::close(fd);
+
+    DiameterServer server(io_, serverConfig(), Transport::SCTP);
+    try {
+        server.listen("::1", 14900);
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "no IPv6 loopback: " << e.what();
+    }
+    DiameterClient client(io_, clientConfig(), Transport::SCTP);
+    client.setReconnectEnabled(false);
+    client.connect("::1", 14900);
+    runFor(std::chrono::milliseconds(500));
+    EXPECT_TRUE(client.isReady());
+    client.close();
+    server.close();
+}
+
+TEST_F(DiameterClient_test, AddressListsNeedSctp) {
+    DiameterServer server(io_, serverConfig(), Transport::TCP);
+    EXPECT_THROW(server.listen("127.0.0.1,127.0.0.2", 14901), std::runtime_error);
+
+    DiameterClient client(io_, clientConfig(), Transport::TCP);
+    client.setReconnectEnabled(false);
+    client.connect("127.0.0.1,127.0.0.2", 14901);
+    runFor(std::chrono::milliseconds(200));
+    EXPECT_FALSE(client.isReady());
+    EXPECT_EQ(client.state(), Peer::State::Closed);
 }

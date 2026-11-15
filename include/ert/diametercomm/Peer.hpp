@@ -118,6 +118,11 @@ class Peer : public std::enable_shared_from_this<Peer> {
         // the connection is closed (RFC 6733 5.3); a negative value sends no CEA at
         // all (the peer stays in WaitCER until the remote side gives up).
         int32_t ceaResultCode{2001};
+        // SCTP association options (heartbeat interval, path max retransmissions,
+        // primary peer address; see Sctp.hpp). Ignored for TCP. localAddress may be
+        // a comma separated list for a multihomed client (and the client host a
+        // list of peer addresses, see PeerConnection::asyncConnect).
+        SctpOptions sctp;
     };
 
     /**
@@ -183,6 +188,9 @@ class Peer : public std::enable_shared_from_this<Peer> {
     // connected) and transport, for diagnostics (e.g. an admin peers listing).
     std::string localEndpoint() const { return connection_->localEndpoint(); }
     std::string remoteEndpoint() const { return connection_->remoteEndpoint(); }
+    // SCTP: peer addresses (paths) with their state, and local addresses (empty for TCP)
+    std::vector<sctp::PathInfo> sctpPaths() const { return connection_->sctpPaths(); }
+    std::vector<std::string> sctpLocalAddresses() const { return connection_->sctpLocalAddresses(); }
     Transport transport() const { return connection_->transport(); }
 
     // --- Base protocol fault injection (tests) ---

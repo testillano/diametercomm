@@ -253,7 +253,7 @@ void Peer::connect(const std::string& host, uint16_t port) {
         // Local source address for the outbound connection (empty = auto-derive
         // egress toward peer). For SCTP this single-homes the INIT; see
         // Config::localAddress and PeerConnection::asyncConnect.
-        config_.localAddress);
+        config_.localAddress, config_.sctp);
 }
 
 // ============================================================================
