@@ -204,6 +204,20 @@ class DiameterClient {
     /** Transport of the connection. */
     Transport transport() const { return transport_; }
 
+    // --- Base protocol fault injection (tests) ---
+    /**
+     * Mute the watchdog of the connection (Peer::setWatchdogMuted), now and for
+     * the peers of the next reconnections, until unmuted.
+     */
+    void setWatchdogMuted(bool muted);
+    bool watchdogMuted() const { return watchdogMuted_.load(); }
+
+    /**
+     * Abrupt close of the current connection (no DPR), keeping the reconnection
+     * (unlike close()): the client reconnects with its backoff.
+     */
+    void dropConnection();
+
     // --- Callbacks ---
     /** Called for unsolicited requests (server-initiated on this connection) */
     void setRequestCallback(RequestCallback cb) { onRequest_ = std::move(cb); }
@@ -287,6 +301,7 @@ class DiameterClient {
     // operation and the backoff; reconnectPending_ allows one armed reconnect
     // (several error handlers may report the same close).
     std::atomic<bool> reconnectEnabled_{true};
+    std::atomic<bool> watchdogMuted_{false};
     mutable std::mutex reconnectMutex_;
     bool reconnectPending_{false};
     std::chrono::milliseconds reconnectInitial_{10000};

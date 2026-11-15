@@ -776,3 +776,53 @@ TEST_F(DiameterClient_test, DiagnosticsAccessors) {
 
     client.close();
 }
+
+// Fault injection: an abrupt drop keeps the reconnection; the muted watchdog
+// carries over to the reconnected peer; the server CEA Result-Code applies to the
+// peers connecting afterwards (a rejected client reconnects until accepted).
+TEST_F(DiameterClient_test, FaultInjectionControls) {
+    DiameterServer server(io_, serverConfig());
+    server.listen("127.0.0.1", 14898);
+    EXPECT_EQ(server.ceaResultCode(), 2001);
+
+    DiameterClient client(io_, clientConfig());
+    client.setReconnectEnabled(true);
+    client.setReconnectBackoff(std::chrono::milliseconds(100), std::chrono::milliseconds(100));
+    std::atomic<int> opens{0};
+    client.setStateCallback([&](Peer::State s) {
+        if (s == Peer::State::Open) opens++;
+    });
+    client.connect("127.0.0.1", 14898);
+    runFor(std::chrono::milliseconds(300));
+    ASSERT_TRUE(client.isReady());
+    EXPECT_EQ(opens.load(), 1);
+
+    // muted watchdog, then an abrupt drop: reconnected, still muted
+    client.setWatchdogMuted(true);
+    EXPECT_TRUE(client.peer()->watchdogMuted());
+    auto before = client.peer();
+    client.dropConnection();
+    runFor(std::chrono::milliseconds(500));
+    EXPECT_TRUE(client.isReady());
+    EXPECT_EQ(opens.load(), 2);
+    EXPECT_NE(client.peer(), before);
+    EXPECT_TRUE(client.peer()->watchdogMuted());
+    client.setWatchdogMuted(false);
+    EXPECT_FALSE(client.peer()->watchdogMuted());
+
+    // the server rejects the next capabilities exchanges: the client cannot open
+    server.setCeaResultCode(5010);
+    client.dropConnection();
+    runFor(std::chrono::milliseconds(500));
+    EXPECT_FALSE(client.isReady());
+    EXPECT_EQ(opens.load(), 2);
+
+    // accepted again: the reconnection opens
+    server.setCeaResultCode(2001);
+    runFor(std::chrono::milliseconds(500));
+    EXPECT_TRUE(client.isReady());
+    EXPECT_EQ(opens.load(), 3);
+
+    client.close();
+    server.close();
+}

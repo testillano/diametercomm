@@ -113,6 +113,11 @@ class Peer : public std::enable_shared_from_this<Peer> {
         // caller must not repeat a built AVP.
         std::vector<uint8_t> extraCerAvps;
         std::vector<uint8_t> extraCeaAvps;
+        // Result-Code of the CEA answered (server side), for negative capabilities
+        // exchange tests: 2001 (default) opens the peer; any other code is sent and
+        // the connection is closed (RFC 6733 5.3); a negative value sends no CEA at
+        // all (the peer stays in WaitCER until the remote side gives up).
+        int32_t ceaResultCode{2001};
     };
 
     /**
@@ -179,6 +184,12 @@ class Peer : public std::enable_shared_from_this<Peer> {
     std::string localEndpoint() const { return connection_->localEndpoint(); }
     std::string remoteEndpoint() const { return connection_->remoteEndpoint(); }
     Transport transport() const { return connection_->transport(); }
+
+    // --- Base protocol fault injection (tests) ---
+    // Muted watchdog: the DWRs received are not answered and none is sent (a silent
+    // peer for the remote watchdog), until unmuted. Any thread.
+    void setWatchdogMuted(bool muted) { watchdogMuted_ = muted; }
+    bool watchdogMuted() const { return watchdogMuted_.load(); }
     // Hop-by-Hop: per-connection sequence (this Peer), randomly seeded.
     uint32_t nextHopByHop() { return hopByHop_.fetch_add(1); }
     // End-to-End: node-wide sequence shared by all Peers of this process
@@ -241,6 +252,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
     static std::atomic<uint32_t> nodeEndToEnd_;
 
     boost::asio::steady_timer watchdogTimer_;
+    std::atomic<bool> watchdogMuted_{false};
 
     std::string remoteOriginHost_;
     std::string remoteOriginRealm_;

@@ -194,6 +194,14 @@ std::string extractStringAvp(const Buffer& msg, uint32_t avpCode) {
     return "";
 }
 
+// Extract an Unsigned32 AVP value by code (0 when absent or too short)
+uint32_t extractUint32Avp(const Buffer& msg, uint32_t avpCode) {
+    const std::string data = extractStringAvp(msg, avpCode);
+    if (data.size() < 4) return 0;
+    return (uint32_t(uint8_t(data[0])) << 24) | (uint32_t(uint8_t(data[1])) << 16) | (uint32_t(uint8_t(data[2])) << 8) |
+           uint32_t(uint8_t(data[3]));
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -358,12 +366,27 @@ void Peer::handleCER(const Buffer& msg) {
     remoteOriginHost_ = extractStringAvp(msg, AVP_ORIGIN_HOST);
     remoteOriginRealm_ = extractStringAvp(msg, AVP_ORIGIN_REALM);
 
+    if (config_.ceaResultCode < 0) {
+        LOGWARNING(ert::tracing::Logger::warning(
+            ert::tracing::Logger::asString("CER received from %s (%s), not answered (no CEA configured)",
+                                           remoteOriginHost_.c_str(), remoteOriginRealm_.c_str()),
+            ERT_FILE_LOCATION));
+        return;  // stays in WaitCER
+    }
+
     LOGINFORMATIONAL(ert::tracing::Logger::informational(
-        ert::tracing::Logger::asString("CER received from %s (%s), sending CEA", remoteOriginHost_.c_str(),
-                                       remoteOriginRealm_.c_str()),
+        ert::tracing::Logger::asString("CER received from %s (%s), sending CEA (Result-Code %d)",
+                                       remoteOriginHost_.c_str(), remoteOriginRealm_.c_str(), config_.ceaResultCode),
         ERT_FILE_LOCATION));
 
     auto cea = buildCEA(msg);
+    if (config_.ceaResultCode != static_cast<int32_t>(DIAMETER_SUCCESS)) {
+        // Capabilities exchange failure: the CEA carries the error and the
+        // connection is closed once it is written (RFC 6733 5.3).
+        auto self = shared_from_this();
+        connection_->asyncWrite(std::move(cea), [self]() { self->close(); });
+        return;
+    }
     connection_->asyncWrite(std::move(cea));
 
     setState(State::Open);
@@ -379,6 +402,20 @@ void Peer::handleCEA(const Buffer& msg) {
     remoteOriginHost_ = extractStringAvp(msg, AVP_ORIGIN_HOST);
     remoteOriginRealm_ = extractStringAvp(msg, AVP_ORIGIN_REALM);
 
+    // A CEA rejecting the capabilities exchange (Result-Code not 2xxx, e.g. 5010
+    // DIAMETER_NO_COMMON_APPLICATION) does not open the peer: the connection is
+    // closed (RFC 6733 5.3). A CEA without Result-Code is accepted (lenient).
+    const uint32_t resultCode = extractUint32Avp(msg, AVP_RESULT_CODE);
+    if (resultCode != 0 && (resultCode < 2000 || resultCode > 2999)) {
+        LOGWARNING(ert::tracing::Logger::warning(
+            ert::tracing::Logger::asString(
+                "CEA from %s (%s) rejects the capabilities exchange (Result-Code %u): closing",
+                remoteOriginHost_.c_str(), remoteOriginRealm_.c_str(), resultCode),
+            ERT_FILE_LOCATION));
+        close();
+        return;
+    }
+
     LOGINFORMATIONAL(ert::tracing::Logger::informational(
         ert::tracing::Logger::asString("CEA received from %s (%s), peer Open", remoteOriginHost_.c_str(),
                                        remoteOriginRealm_.c_str()),
@@ -393,6 +430,13 @@ void Peer::handleCEA(const Buffer& msg) {
 // ============================================================================
 void Peer::handleDWR(const Buffer& msg) {
     if (state_ != State::Open) return;
+    if (watchdogMuted_) {
+        LOGINFORMATIONAL(ert::tracing::Logger::informational(
+            ert::tracing::Logger::asString("DWR received from %s, not answered (watchdog muted)",
+                                           remoteOriginHost_.c_str()),
+            ERT_FILE_LOCATION));
+        return;
+    }
     LOGINFORMATIONAL(ert::tracing::Logger::informational(
         ert::tracing::Logger::asString("DWR received from %s, sending DWA", remoteOriginHost_.c_str()),
         ERT_FILE_LOCATION));
@@ -459,7 +503,8 @@ Peer::Buffer Peer::buildCEA(const Buffer& cer) const {
 
     writeMessageHeader(msg, 0 /*answer: no R-flag*/, CMD_CER, 0, hbh, e2e);
 
-    appendUint32Avp(msg, AVP_RESULT_CODE, AVP_FLAG_MANDATORY, DIAMETER_SUCCESS);
+    appendUint32Avp(msg, AVP_RESULT_CODE, AVP_FLAG_MANDATORY,
+                    config_.ceaResultCode > 0 ? static_cast<uint32_t>(config_.ceaResultCode) : DIAMETER_SUCCESS);
     appendStringAvp(msg, AVP_ORIGIN_HOST, AVP_FLAG_MANDATORY, config_.originHost);
     appendStringAvp(msg, AVP_ORIGIN_REALM, AVP_FLAG_MANDATORY, config_.originRealm);
     appendAddressAvp(msg, AVP_HOST_IP_ADDRESS, AVP_FLAG_MANDATORY, config_.hostIpAddress);
@@ -531,11 +576,14 @@ void Peer::startWatchdog() {
         if (ec) return;  // cancelled
         if (self->state_ != State::Open) return;
 
-        LOGINFORMATIONAL(ert::tracing::Logger::informational(
-            ert::tracing::Logger::asString("Sending DWR to %s", self->remoteOriginHost_.c_str()), ERT_FILE_LOCATION));
-        auto dwr = self->buildDWR();
-        self->connection_->asyncWrite(std::move(dwr));
-        self->startWatchdog();  // reschedule
+        if (!self->watchdogMuted_) {
+            LOGINFORMATIONAL(ert::tracing::Logger::informational(
+                ert::tracing::Logger::asString("Sending DWR to %s", self->remoteOriginHost_.c_str()),
+                ERT_FILE_LOCATION));
+            auto dwr = self->buildDWR();
+            self->connection_->asyncWrite(std::move(dwr));
+        }
+        self->startWatchdog();  // reschedule (a muted watchdog resumes on unmute)
     };
     watchdogTimer_.async_wait(boost::asio::bind_executor(connection_->executor(), std::move(onExpiry)));
 }

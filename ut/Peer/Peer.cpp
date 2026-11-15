@@ -479,3 +479,130 @@ TEST_F(Peer_test, ExtraCeaAvpsAndNoneByDefault) {
     cerPeer->close();
     serverPeer->close();
 }
+
+// ============================================================================
+// Base protocol fault injection: muted watchdog, CEA rejection, no CEA
+// ============================================================================
+namespace {
+// Header-only base protocol message (command, request flag, hbh/e2e), with an
+// optional Result-Code (answers).
+Peer::Buffer baseMessage(uint32_t command, bool request, uint32_t hbh, uint32_t e2e, uint32_t resultCode = 0) {
+    Peer::Buffer msg(20, 0);
+    msg[0] = 1;
+    msg[4] = request ? 0x80 : 0x00;
+    msg[5] = uint8_t(command >> 16);
+    msg[6] = uint8_t(command >> 8);
+    msg[7] = uint8_t(command);
+    for (int i = 0; i < 4; ++i) {
+        msg[12 + i] = uint8_t(hbh >> (24 - 8 * i));
+        msg[16 + i] = uint8_t(e2e >> (24 - 8 * i));
+    }
+    if (resultCode) {
+        const uint8_t avp[] = {0,
+                               0,
+                               1,
+                               12,
+                               0x40,
+                               0,
+                               0,
+                               12,
+                               uint8_t(resultCode >> 24),
+                               uint8_t(resultCode >> 16),
+                               uint8_t(resultCode >> 8),
+                               uint8_t(resultCode)};
+        msg.insert(msg.end(), std::begin(avp), std::end(avp));
+    }
+    msg[3] = uint8_t(msg.size());
+    return msg;
+}
+uint32_t commandOf(const Peer::Buffer& m) { return (uint32_t(m[5]) << 16) | (uint32_t(m[6]) << 8) | m[7]; }
+uint32_t hbhOf(const Peer::Buffer& m) {
+    return (uint32_t(m[12]) << 24) | (uint32_t(m[13]) << 16) | (uint32_t(m[14]) << 8) | m[15];
+}
+uint32_t e2eOf(const Peer::Buffer& m) {
+    return (uint32_t(m[16]) << 24) | (uint32_t(m[17]) << 16) | (uint32_t(m[18]) << 8) | m[19];
+}
+}  // namespace
+
+TEST_F(Peer_test, WatchdogMuted) {
+    auto config = clientConfig();
+    config.watchdogIntervalSec = 1;
+    boost::asio::ip::tcp::socket raw(io_);
+    acceptor_->async_accept(raw, [](const boost::system::error_code&) {});
+    auto clientPeer = std::make_shared<Peer>(io_, config);
+    clientPeer->connect("127.0.0.1", port_);
+    runFor(std::chrono::milliseconds(300));
+    ASSERT_TRUE(raw.is_open());
+    const auto cer = readMessage(raw);
+    boost::asio::write(raw, boost::asio::buffer(baseMessage(257, false, hbhOf(cer), e2eOf(cer), 2001)));
+    runFor(std::chrono::milliseconds(200));
+    ASSERT_EQ(clientPeer->state(), Peer::State::Open);
+
+    // muted: no DWR sent, a DWR received is not answered
+    clientPeer->setWatchdogMuted(true);
+    EXPECT_TRUE(clientPeer->watchdogMuted());
+    boost::asio::write(raw, boost::asio::buffer(baseMessage(280, true, 7, 7)));
+    runFor(std::chrono::milliseconds(1500));
+    EXPECT_EQ(raw.available(), 0u);
+    EXPECT_EQ(clientPeer->state(), Peer::State::Open);
+
+    // unmuted: the DWR is answered (DWA) and the periodic DWR is sent again
+    clientPeer->setWatchdogMuted(false);
+    boost::asio::write(raw, boost::asio::buffer(baseMessage(280, true, 8, 8)));
+    runFor(std::chrono::milliseconds(1300));
+    bool dwa = false, dwr = false;
+    while (raw.available() > 0) {
+        const auto m = readMessage(raw);
+        if (commandOf(m) == 280 && !(m[4] & 0x80) && hbhOf(m) == 8) dwa = true;
+        if (commandOf(m) == 280 && (m[4] & 0x80)) dwr = true;
+    }
+    EXPECT_TRUE(dwa);
+    EXPECT_TRUE(dwr);
+    clientPeer->close();
+}
+
+TEST_F(Peer_test, CeaRejectionAndNoCea) {
+    for (const int32_t code : {5010, -1}) {
+        SCOPED_TRACE(code);
+        auto sConfig = serverConfig();
+        sConfig.ceaResultCode = code;
+        auto serverPeer =
+            std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_, sConfig);
+        acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+            if (!ec) serverPeer->start();
+        });
+        auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
+        std::atomic<bool> opened{false};
+        clientPeer->setStateCallback([&](std::shared_ptr<Peer>, Peer::State s) {
+            if (s == Peer::State::Open) opened = true;
+        });
+        clientPeer->connect("127.0.0.1", port_);
+        runFor(std::chrono::milliseconds(500));
+
+        EXPECT_FALSE(opened);
+        if (code > 0) {  // rejected: both sides closed
+            EXPECT_EQ(clientPeer->state(), Peer::State::Closed);
+            EXPECT_EQ(serverPeer->state(), Peer::State::Closed);
+        } else {  // not answered: still exchanging capabilities
+            EXPECT_EQ(clientPeer->state(), Peer::State::WaitCEA);
+            EXPECT_EQ(serverPeer->state(), Peer::State::WaitCER);
+        }
+        clientPeer->close();
+        serverPeer->close();
+        runFor(std::chrono::milliseconds(100));
+    }
+}
+
+TEST_F(Peer_test, CeaRejectionReceived) {
+    // a client receiving a rejecting CEA (raw server) does not open
+    boost::asio::ip::tcp::socket raw(io_);
+    acceptor_->async_accept(raw, [](const boost::system::error_code&) {});
+    auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
+    clientPeer->connect("127.0.0.1", port_);
+    runFor(std::chrono::milliseconds(300));
+    ASSERT_TRUE(raw.is_open());
+    const auto cer = readMessage(raw);
+    boost::asio::write(raw, boost::asio::buffer(baseMessage(257, false, hbhOf(cer), e2eOf(cer), 5010)));
+    runFor(std::chrono::milliseconds(300));
+    EXPECT_EQ(clientPeer->state(), Peer::State::Closed);
+}

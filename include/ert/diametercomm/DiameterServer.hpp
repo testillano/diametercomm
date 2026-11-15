@@ -35,6 +35,7 @@ Copyright (c) 2024 Eduardo Ramos
 
 #pragma once
 
+#include <atomic>
 #include <boost/asio.hpp>
 #include <chrono>
 #include <cstdint>
@@ -125,6 +126,15 @@ class DiameterServer {
      * Get all active peers.
      */
     std::vector<std::shared_ptr<Peer>> peers() const;
+
+    /**
+     * Result-Code of the CEA answered to the peers connecting from now on
+     * (Peer::Config::ceaResultCode: 2001 opens, another code rejects and closes,
+     * negative answers nothing). For negative capabilities exchange tests; the
+     * connected peers are not affected. Any thread.
+     */
+    void setCeaResultCode(int32_t code) { ceaResultCode_ = code; }
+    int32_t ceaResultCode() const { return ceaResultCode_.load(); }
 
     // --- Callbacks ---
     void setRequestCallback(RequestCallback cb) { onRequest_ = std::move(cb); }
@@ -218,6 +228,7 @@ class DiameterServer {
     boost::asio::io_context &io_;
     boost::asio::ip::tcp::acceptor acceptor_;
     Peer::Config config_;
+    std::atomic<int32_t> ceaResultCode_{2001};
     Transport transport_;
     std::shared_ptr<boost::asio::ssl::context> serverCtx_;  // prebuilt TLS/TCP server context (null if insecure)
 

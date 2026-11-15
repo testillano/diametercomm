@@ -168,6 +168,7 @@ void DiameterClient::connect(const std::string& host, uint16_t port) {
 
 void DiameterClient::openPeer() {
     auto peer = std::make_shared<Peer>(io_, config_, transport_);
+    peer->setWatchdogMuted(watchdogMuted_);
 
     peer->setStateCallback([this](std::shared_ptr<Peer> p, Peer::State s) { onPeerState(std::move(p), s); });
 
@@ -426,6 +427,15 @@ bool DiameterClient::isReady() const {
 Peer::State DiameterClient::state() const {
     auto peer = currentPeer();
     return peer ? peer->state() : Peer::State::Closed;
+}
+
+void DiameterClient::setWatchdogMuted(bool muted) {
+    watchdogMuted_ = muted;
+    if (auto peer = currentPeer()) peer->setWatchdogMuted(muted);
+}
+
+void DiameterClient::dropConnection() {
+    if (auto peer = currentPeer()) peer->close();  // Closed -> scheduleReconnect (when enabled)
 }
 
 bool DiameterClient::reconnecting() const {

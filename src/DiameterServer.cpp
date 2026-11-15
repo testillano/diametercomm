@@ -88,7 +88,7 @@ uint32_t extractResultCode(const Peer::Buffer& msg) {
 }  // anonymous namespace
 
 DiameterServer::DiameterServer(boost::asio::io_context& io, const Peer::Config& config, Transport transport)
-    : io_(io), acceptor_(io), config_(config), transport_(transport) {
+    : io_(io), acceptor_(io), config_(config), ceaResultCode_(config.ceaResultCode), transport_(transport) {
     // Build the TLS/TCP server context once (reused for every accepted peer).
     // TLS is not applied to SCTP (DTLS/SCTP is out of scope -- see README gap).
     if (config_.tls.enabled && transport_ == Transport::TCP) {
@@ -447,7 +447,9 @@ void DiameterServer::doAccept() {
 
         // Create + start the server-side Peer on a (possibly TLS-handshaked) connection.
         auto startPeer = [this](std::shared_ptr<PeerConnection> conn) {
-            auto peer = std::make_shared<Peer>(conn, io_, config_);
+            Peer::Config peerConfig = config_;
+            peerConfig.ceaResultCode = ceaResultCode_.load();
+            auto peer = std::make_shared<Peer>(conn, io_, peerConfig);
 
             peer->setRequestCallback(
                 [this](std::shared_ptr<Peer> p, Peer::Buffer&& msg) { onPeerMessage(std::move(p), std::move(msg)); });
