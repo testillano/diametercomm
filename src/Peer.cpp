@@ -444,6 +444,7 @@ Peer::Buffer Peer::buildCER() const {
             appendUint32Avp(msg, AVP_AUTH_APP_ID, AVP_FLAG_MANDATORY, appId);
         }
     }
+    msg.insert(msg.end(), config_.extraCerAvps.begin(), config_.extraCerAvps.end());
     fixMessageLength(msg);
     return msg;
 }
@@ -469,6 +470,7 @@ Peer::Buffer Peer::buildCEA(const Buffer& cer) const {
             appendUint32Avp(msg, AVP_AUTH_APP_ID, AVP_FLAG_MANDATORY, appId);
         }
     }
+    msg.insert(msg.end(), config_.extraCeaAvps.begin(), config_.extraCeaAvps.end());
     fixMessageLength(msg);
     return msg;
 }

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <ert/diametercomm/Peer.hpp>
@@ -370,4 +371,111 @@ TEST_F(Peer_test, HopByHopIsPerConnection) {
     EXPECT_EQ(b2, b1 + 1);  // b advances on its own counter
     // Interleaving a and b did not perturb each other's sequence: this only
     // holds if the counters are per-Peer (not shared like End-to-End).
+}
+
+// ============================================================================
+// Test: extra CER / CEA AVPs are appended verbatim after the built ones
+// (one side is a raw socket, to read the base protocol message as it travels)
+// ============================================================================
+namespace {
+// Supported-Vendor-Id (265) = 10415, flags 0: 8-byte header + 4-byte value
+const std::vector<uint8_t> SupportedVendorId10415 = {0, 0, 1, 9, 0, 0, 0, 12, 0, 0, 0x28, 0xaf};
+// Firmware-Revision (267) = 7
+const std::vector<uint8_t> FirmwareRevision7 = {0, 0, 1, 11, 0, 0, 0, 12, 0, 0, 0, 7};
+
+// Whole message read from a raw socket (4-byte header gives the length).
+Peer::Buffer readMessage(boost::asio::ip::tcp::socket& s) {
+    Peer::Buffer msg(4);
+    boost::asio::read(s, boost::asio::buffer(msg));
+    const std::size_t len = (std::size_t(msg[1]) << 16) | (std::size_t(msg[2]) << 8) | msg[3];
+    msg.resize(len);
+    boost::asio::read(s, boost::asio::buffer(msg.data() + 4, len - 4));
+    return msg;
+}
+
+// Codes of the AVPs of a message (top level), in order.
+std::vector<uint32_t> avpCodes(const Peer::Buffer& msg) {
+    std::vector<uint32_t> codes;
+    std::size_t pos = 20;
+    while (pos + 8 <= msg.size()) {
+        codes.push_back((uint32_t(msg[pos]) << 24) | (uint32_t(msg[pos + 1]) << 16) | (uint32_t(msg[pos + 2]) << 8) |
+                        msg[pos + 3]);
+        std::size_t len = (std::size_t(msg[pos + 5]) << 16) | (std::size_t(msg[pos + 6]) << 8) | msg[pos + 7];
+        pos += (len + 3) & ~std::size_t(3);
+    }
+    return codes;
+}
+
+bool endsWith(const Peer::Buffer& msg, const std::vector<uint8_t>& tail) {
+    return msg.size() >= tail.size() && std::equal(tail.begin(), tail.end(), msg.end() - tail.size());
+}
+}  // namespace
+
+TEST_F(Peer_test, ExtraCerAvps) {
+    auto config = clientConfig();
+    config.extraCerAvps = SupportedVendorId10415;
+    config.extraCerAvps.insert(config.extraCerAvps.end(), FirmwareRevision7.begin(), FirmwareRevision7.end());
+
+    boost::asio::ip::tcp::socket raw(io_);
+    acceptor_->async_accept(raw, [](const boost::system::error_code&) {});
+    auto clientPeer = std::make_shared<Peer>(io_, config);
+    clientPeer->connect("127.0.0.1", port_);
+    runFor(std::chrono::milliseconds(300));
+    ASSERT_TRUE(raw.is_open());
+
+    const Peer::Buffer cer = readMessage(raw);
+    EXPECT_EQ(cer[4] & 0x80, 0x80);  // request
+    EXPECT_EQ((uint32_t(cer[5]) << 16) | (uint32_t(cer[6]) << 8) | cer[7], 257u);
+    // built AVPs first (Origin-Host, Origin-Realm, Host-IP-Address, Vendor-Id, Product-Name,
+    // Auth-Application-Id), then the extra ones, in order
+    EXPECT_EQ(avpCodes(cer), (std::vector<uint32_t>{264, 296, 257, 266, 269, 258, 265, 267}));
+    EXPECT_TRUE(endsWith(cer, FirmwareRevision7));
+    clientPeer->close();
+}
+
+TEST_F(Peer_test, ExtraCeaAvpsAndNoneByDefault) {
+    // default: no extra AVP in the CER
+    {
+        boost::asio::ip::tcp::socket raw(io_);
+        acceptor_->async_accept(raw, [](const boost::system::error_code&) {});
+        auto clientPeer = std::make_shared<Peer>(io_, clientConfig());
+        clientPeer->connect("127.0.0.1", port_);
+        runFor(std::chrono::milliseconds(300));
+        ASSERT_TRUE(raw.is_open());
+        EXPECT_EQ(avpCodes(readMessage(raw)), (std::vector<uint32_t>{264, 296, 257, 266, 269, 258}));
+        clientPeer->close();
+    }
+
+    // CEA: a server peer with extra AVPs answers the CER of a client peer; the raw side
+    // is the client, so take the CER of a client Peer through a second raw acceptor
+    auto config = serverConfig();
+    config.extraCeaAvps = SupportedVendorId10415;
+    auto serverPeer =
+        std::make_shared<Peer>(std::make_shared<PeerConnection>(boost::asio::ip::tcp::socket(io_)), io_, config);
+    acceptor_->async_accept(serverPeer->socket(), [&](const boost::system::error_code& ec) {
+        if (!ec) serverPeer->start();
+    });
+
+    boost::asio::ip::tcp::acceptor cerSource(io_, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    boost::asio::ip::tcp::socket cerRaw(io_);
+    cerSource.async_accept(cerRaw, [](const boost::system::error_code&) {});
+    auto cerPeer = std::make_shared<Peer>(io_, clientConfig());
+    cerPeer->connect("127.0.0.1", cerSource.local_endpoint().port());
+
+    boost::asio::ip::tcp::socket raw(io_);
+    raw.async_connect({boost::asio::ip::make_address("127.0.0.1"), port_}, [](const boost::system::error_code&) {});
+    runFor(std::chrono::milliseconds(300));
+    ASSERT_TRUE(cerRaw.is_open());
+    const Peer::Buffer cer = readMessage(cerRaw);
+    boost::asio::write(raw, boost::asio::buffer(cer));
+    runFor(std::chrono::milliseconds(300));
+
+    const Peer::Buffer cea = readMessage(raw);
+    EXPECT_EQ(cea[4] & 0x80, 0);  // answer
+    EXPECT_EQ((uint32_t(cea[5]) << 16) | (uint32_t(cea[6]) << 8) | cea[7], 257u);
+    EXPECT_EQ(avpCodes(cea), (std::vector<uint32_t>{268, 264, 296, 257, 266, 269, 258, 265}));
+    EXPECT_TRUE(endsWith(cea, SupportedVendorId10415));
+    EXPECT_EQ(serverPeer->state(), Peer::State::Open);
+    cerPeer->close();
+    serverPeer->close();
 }

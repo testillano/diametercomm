@@ -102,8 +102,17 @@ class Peer : public std::enable_shared_from_this<Peer> {
         // For SCTP this single-homes the association, avoiding advertisement of
         // non-routable local interfaces (docker0, bridges) that would stall the
         // handshake in COOKIE_WAIT. See PeerConnection::asyncConnect for details.
-        // Kept LAST in this struct to preserve positional aggregate initializers.
+        // Kept after the fields above to preserve positional aggregate initializers.
         std::string localAddress;
+        // Extra AVPs appended verbatim to the CER (client side) / CEA (server side)
+        // after the ones built from this config (Origin-Host, Origin-Realm,
+        // Host-IP-Address, Vendor-Id, Product-Name, Auth-Application-Id; the CEA
+        // also Result-Code). Already encoded AVPs, each one padded to 4 bytes (as
+        // an encoder writes them), e.g. Supported-Vendor-Id or Firmware-Revision.
+        // Empty (default): only the built ones. The content is not checked: the
+        // caller must not repeat a built AVP.
+        std::vector<uint8_t> extraCerAvps;
+        std::vector<uint8_t> extraCeaAvps;
     };
 
     /**
